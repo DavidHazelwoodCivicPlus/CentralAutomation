@@ -1,0 +1,31 @@
+@echo off
+rem Opens the AutoCentral window. scan.bat runs a scan from the command line instead.
+setlocal
+cd /d "%~dp0"
+if not exist ".venv\Scripts\python.exe" (
+  echo Setting up for first use...
+  python -m venv .venv || goto :nopython
+  ".venv\Scripts\python.exe" -m pip install --quiet --upgrade pip
+  ".venv\Scripts\python.exe" -m pip install --quiet -r requirements.txt || goto :fail
+  copy /y requirements.txt ".venv\requirements.installed" >nul
+)
+rem Install anything new when requirements.txt has changed since the last install.
+fc /b requirements.txt ".venv\requirements.installed" >nul 2>&1 || (
+  echo Installing updated requirements...
+  ".venv\Scripts\python.exe" -m pip install --quiet -r requirements.txt && (
+    copy /y requirements.txt ".venv\requirements.installed" >nul
+  ) || (
+    echo Could not install the new requirements; starting anyway. It will try again next time.
+  )
+)
+".venv\Scripts\python.exe" -m autocentral --gui
+if errorlevel 1 pause
+exit /b
+:nopython
+echo Python 3.10+ is needed. Install it from the Software Center, then run this again.
+pause
+exit /b 1
+:fail
+echo Installing requirements failed. See the message above.
+pause
+exit /b 1
