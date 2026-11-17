@@ -23,6 +23,7 @@ class RowFilter:
     created_to: str = ""
     text: str = ""                                        # in name, category or detail
     regex: bool = False
+    include_unknown: bool = False   # rows with no Created date pass the date range
 
     def match(self, r: InventoryRow) -> bool:
         low = lambda xs: {x.strip().lower() for x in xs if x.strip()}
@@ -36,7 +37,7 @@ class RowFilter:
             who = (r.created_by or "unknown").lower()
             if who not in low(self.created_by):
                 return False
-        if self.created_from or self.created_to:
+        if (self.created_from or self.created_to) and (r.created_on or not self.include_unknown):
             if not r.created_on:
                 return False
             if self.created_from and r.created_on < _bound(self.created_from, start=True):
@@ -44,7 +45,7 @@ class RowFilter:
             if self.created_to and r.created_on > _bound(self.created_to, start=False):
                 return False
         if self.text:
-            hay = " ".join([r.name, r.category, r.detail])
+            hay = " ".join([r.name, r.category, r.detail, *map(str, r.fields.values())])
             if self.regex:
                 try:
                     if not re.search(self.text, hay, re.I):
@@ -81,13 +82,19 @@ def export_xlsx(path: Path, site: str, scans: list[ModuleScan], rows: Optional[l
     wb = Workbook()
     ws = wb.active
     ws.title = "Inventory"
-    ws.append([label for _, label in COLUMNS])
+    extra_cols: list[str] = []          # the modules' own columns, in the order first seen
+    for r in rows:
+        for k in r.fields:
+            if k not in extra_cols:
+                extra_cols.append(k)
+    ws.append([label for _, label in COLUMNS] + extra_cols)
     for c in ws[1]:
         c.font = Font(bold=True)
     grey = PatternFill("solid", fgColor="EEEEEE")
     for r in rows:
         d = r.as_dict()
-        ws.append([d.get(k) if d.get(k) not in (None,) else "" for k, _ in COLUMNS])
+        ws.append([d.get(k) if d.get(k) not in (None,) else "" for k, _ in COLUMNS] +
+                  [r.fields.get(k, "") for k in extra_cols])
         if r.level == "category":
             for c in ws[ws.max_row]:
                 c.fill = grey

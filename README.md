@@ -20,28 +20,67 @@ Chrome.
 
 ### The window
 
+The window has an **Overview** tab and one tab per module. Each tab is named
+the way the site names that module (e.g. "Bid Postings").
+
 1. Enter the site URL and click **Open Chrome and log in**. Log in yourself,
    including 2FA. The status line says when the tool has taken over.
-2. Tick the modules to read. Leave **Who created / when (History Log)** ticked
-   to fill in Created and Created By (see below; it takes longer).
-3. Click **Scan (read-only)**. Each module appears in the table as soon as it
-   has been read. **Stop** ends the scan after the pages being read.
-4. Filter the table:
-   - by module, level (category or item), status, or creator ("unknown" =
-     no creator found);
-   - by created date range: `2024-03-05`, or `2024-03-05 14:00` for a time;
-   - by search text in the name, category or detail, with an optional regex.
+   Whatever was last read on that site shows straight away, with the date
+   and time it was read.
+2. Read the site, all at once or one module at a time:
+   - **Read all modules** (top right) reads every module.
+   - **Read this module** (in a module's tab) reads only that one.
 
-   Click a column heading to sort by it.
-5. Export the result:
-   - **Export shown rows…** saves what the filters show.
-   - **Export everything…** saves all rows.
+   Reading never changes anything. **Stop** ends a read after the pages being
+   read. Leave **Created info (History Log)** ticked to fill in Created and
+   Created By (see below).
+3. A module's tab shows its categories with their items under them, as a
+   tree. The Staff Directory nests departments the way the site does.
+   Besides Status, Created, Created By, Last Modified and Modified By, each
+   module has its own columns, for example:
+
+   | Module | Its own columns |
+   |---|---|
+   | Agenda Center | Meeting date, Minutes |
+   | Calendar | Events (calendars); Starts, Ends, Past (events) |
+   | News Flash | Start Date, End Date |
+   | Archive Center | Date |
+   | Form Center | Submissions |
+   | Facilities | Upcoming reservations, Subfacilities |
+
+   Click a column heading to sort; items sort within their category.
+4. Filter a tab:
+   - by **Status**;
+   - by **Created by**. Pick **(no info)** to see only the records the site has
+     no creator for;
+   - by **Created from / to**: `2024-03-05`, or `2024-03-05 14:00` for a time.
+     **Also show records with no created info** is on by default, so a date
+     filter never hides those records; untick it to see only records with a
+     known date;
+   - by **Search** text, in the name, category, notes and the module's own
+     columns, with an optional regex.
+
+   A category whose items match but which doesn't match itself stays in the
+   tree, in grey.
+5. Tick rows with the box in front of the name, or select rows and press the
+   space bar. Ticking a category ticks the rows shown under it. **Tick shown**,
+   **Untick all** and **Ticked only** help with bigger selections. Ticks don't
+   do anything yet. Later actions (delete, publish, unpublish ...) will act on
+   them.
+6. The **Overview** tab lists every module: on the site or not, counts, how
+   many have created info, when it was last read, and the notes from the
+   read (pages that failed, records with no History Log rows). Double-click a
+   module to open its tab.
+7. Export:
+   - **Export shown rows…** in a module tab saves what that tab shows.
+   - **Export everything…** in the Overview saves every module.
 
    Both go to an `.xlsx` with three sheets:
-   - **Inventory**: the rows.
-   - **Summary**: per module, the counts, the time taken, and anything the
-     tool couldn't read.
-   - **ScanInfo**: the site and the scan time.
+   - **Inventory**: the rows, with each module's own columns at the end.
+   - **Summary**: per module, the counts, the time taken, and the notes.
+   - **ScanInfo**: the site and the time of the export.
+
+The last read of each module is kept in `cache\<site>\inventory_<module>.json`.
 
 ### The command line
 
@@ -139,8 +178,10 @@ autocentral/
   scanner.py     site profile + one reader per module style
   historylog.py  History Log search + matching to the table
   inventory.py   filters + spreadsheet export
+  store.py       last read of each module, saved per site
   models.py      InventoryRow, HistoryEntry, ModuleScan
-  cli.py, gui.py front ends
+  cli.py         command line (scan.bat)
+  gui.py         the window: Overview + one tab per module (run.bat)
 tests/           offline tests:  python -m unittest discover -s tests -t .
 tests/pages/     saved copies of training19 admin pages
 ```

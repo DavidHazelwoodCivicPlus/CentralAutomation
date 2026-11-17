@@ -257,7 +257,9 @@ class Scanner:
                 detail = f"Meeting {a['meeting']}" + ("; has minutes" if a["minutes"] else "")
                 ms.rows.append(InventoryRow(m.key, "item", c["name"], a["name"], a["status"],
                                             category_id=c["id"], item_id=a["id"], modified_on=a["updated"],
-                                            detail=detail, extra={"meeting": a["meeting"]}))
+                                            detail=detail, extra={"meeting": a["meeting"]},
+                                            fields={"Meeting date": parse.site_date(a["meeting"]),
+                                                    "Minutes": "yes" if a["minutes"] else "no"}))
 
     def _scan_forms(self, m: ModuleDef, html: str, ms: ModuleScan) -> None:
         cats = self._categories_newer(m, html, ms)
@@ -267,7 +269,8 @@ class Scanner:
             for f in by_cat[c["id"]]:
                 ms.rows.append(InventoryRow(m.key, "item", c["name"], f["name"], f["status"],
                                             category_id=c["id"], item_id=f["id"], modified_on=f["modified"],
-                                            detail=f"{f['submissions'] or 0} submission(s)"))
+                                            detail=f"{f['submissions'] or 0} submission(s)",
+                                            fields={"Submissions": f["submissions"] or "0"}))
 
     def _scan_facilities(self, m: ModuleDef, html: str, ms: ModuleScan) -> None:
         cats = self._categories_newer(m, html, ms)
@@ -278,9 +281,23 @@ class Scanner:
                 detail = f"{f['reservations'] or 0} upcoming reservation(s)" + \
                          ("; has subfacilities" if f["has_children"] else "")
                 ms.rows.append(InventoryRow(m.key, "item", c["name"], f["name"], f["status"],
-                                            category_id=c["id"], item_id=f["id"], detail=detail))
+                                            category_id=c["id"], item_id=f["id"], detail=detail,
+                                            fields={"Upcoming reservations": f["reservations"] or "0",
+                                                    "Subfacilities": "yes" if f["has_children"] else "no"}))
 
     # --------------------------------------------------------- classic pages
+    @staticmethod
+    def _fields(cols: dict, skip: set) -> dict:
+        """A classic list's own columns, minus the name/status ones. Date
+        columns are turned into YYYY-MM-DD so they sort and filter."""
+        out = {}
+        for k, v in cols.items():
+            if k in skip:
+                continue
+            v = "" if v.lower().startswith("select ") else v
+            out[k] = parse.site_date(v) if "date" in k.lower() and v else v
+        return out
+
     @staticmethod
     def _detail(cols: dict, skip: set) -> str:
         return "; ".join(f"{k}: {v}" for k, v in cols.items() if v and k not in skip)
@@ -292,6 +309,8 @@ class Scanner:
                                         category_id=c["id"],
                                         modified_by=c["cols"].get("Last Modified By", ""),
                                         detail=self._detail(c["cols"], {"Status", "Last Modified By"} |
+                                                            {k for k, v in c["cols"].items() if v == c["name"]}),
+                                        fields=self._fields(c["cols"], {"Status", "Last Modified By"} |
                                                             {k for k, v in c["cols"].items() if v == c["name"]})))
         jobs = [{"src": m.path, "steps": [VIEW_LIST_JS % (c["id"], 0)]} for c in cats]
         arg = ITEM_ID_ARG.get(m.key, 0)
@@ -312,6 +331,8 @@ class Scanner:
                     category_id=c["id"], item_id=it["id"],
                     modified_by=it["cols"].get("Last Modified By", ""),
                     detail=self._detail(it["cols"], {"Status", "Last Modified By"} |
+                                        {k for k, v in it["cols"].items() if v == it["name"]}),
+                    fields=self._fields(it["cols"], {"Status", "Last Modified By"} |
                                         {k for k, v in it["cols"].items() if v == it["name"]})))
         self.r.info(f"{ms.label}: archived categories and items are not read yet "
                     "(the site hides them behind Show Archived).")
@@ -327,7 +348,8 @@ class Scanner:
         for c in cals:
             detail = f"{c['events']} event(s)" if c["events"] is not None else ""
             ms.rows.append(InventoryRow(m.key, "category", c["name"], c["name"], c["status"],
-                                        category_id=c["id"], detail=detail))
+                                        category_id=c["id"], detail=detail,
+                                        fields={"Events": "" if c["events"] is None else str(c["events"])}))
         if not cals:
             return
         # The event list hides past events unless "Previous" is ticked in the
@@ -385,8 +407,11 @@ class Scanner:
                     seen.setdefault(e["id"], e)
             for e in seen.values():
                 detail = e["when"] + (" (past)" if e["past"] else "")
+                start, _, end = re.sub(r"\s*[–—]\s*", " - ", parse.clean(e["when"])).partition(" - ")
                 ms.rows.append(InventoryRow(m.key, "item", c["name"], e["name"], e["status"],
-                                            category_id=c["id"], item_id=e["id"], detail=detail))
+                                            category_id=c["id"], item_id=e["id"], detail=detail,
+                                            fields={"Starts": parse.site_date(start), "Ends": parse.site_date(end),
+                                                    "Past": "yes" if e["past"] else "no"}))
             expected = len(all_ids) or total or 0
             if c["id"] in pages and expected and len(seen) != expected:
                 ms.problems.append(f"Calendar {c['name']!r}: the site lists {expected} event(s); "
@@ -413,6 +438,8 @@ class Scanner:
             ms.rows.append(InventoryRow(m.key, "item", "", it["name"], parse.classic_status(it),
                                         item_id=it["id"],
                                         detail=self._detail(it["cols"], {"Status"} |
+                                                            {k for k, v in it["cols"].items() if v == it["name"]}),
+                                        fields=self._fields(it["cols"], {"Status"} |
                                                             {k for k, v in it["cols"].items() if v == it["name"]})))
 
     def _scan_staff(self, m: ModuleDef, html: str, ms: ModuleScan) -> None:
@@ -430,7 +457,9 @@ class Scanner:
         for d in tree:
             ms.rows.append(InventoryRow(m.key, "category", " > ".join(d["path"] + [d["name"]]), d["name"],
                                         d["status"], category_id=d["id"],
-                                        detail=" > ".join(d["path"]) and f"In {' > '.join(d['path'])}"))
+                                        detail=" > ".join(d["path"]) and f"In {' > '.join(d['path'])}",
+                                        extra={"parent_id": d.get("parent")},
+                                        fields={"Parent department": " > ".join(d["path"])}))
         try:
             data, _ = self.b.fetch_bytes("/Admin/Directory/Admin/ExportAllExcel")
             export = parse.staff_export(data)
@@ -447,7 +476,9 @@ class Scanner:
             dept = next((e[k] for k in e if k.lower().startswith("department") and e[k]), "")
             title = e.get("Title") or e.get("Job Title") or ""
             ms.rows.append(InventoryRow(m.key, "item", dept, name, "",
-                                        detail="; ".join(x for x in (title, e.get("Email", "")) if x)))
+                                        detail="; ".join(x for x in (title, e.get("Email", "")) if x),
+                                        fields={"Title": title, "Email": e.get("Email", ""),
+                                                "Phone": e.get("Phone") or e.get("Work Phone") or ""}))
         if export["employees"]:
             ms.problems.append("Employees come from Export Staff, which has no IDs, so they have no "
                                "Created / Created By and no status yet")

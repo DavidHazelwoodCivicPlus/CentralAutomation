@@ -408,6 +408,15 @@ training sites.
 | Staff Directory | Departments from the tree, no Live Edit |
 | History Log | Join and per-site cache built |
 
+**Status (2026-11-17):** the window now has an Overview tab and one tab per
+module. Each tab shows the module as a tree (categories, their items) with
+the module's own columns, its own filters and a tick box on every row, and
+reads on its own (**Read this module**) or with the rest (**Read all
+modules**). The last read of each module is saved per site. Created date and
+Created By can both be filtered, and records with no created info are never
+hidden by a date filter unless asked. The ticks are the selection that later
+actions (delete, publish, unpublish, edit) will act on.
+
 Still to do in this phase:
 
 - archived records (Show Archived, which is mostly version history);

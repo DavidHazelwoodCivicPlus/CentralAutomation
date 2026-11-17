@@ -43,7 +43,8 @@ def site_date(text: str) -> str:
         return ""
     for fmt, out in (("%m/%d/%Y %I:%M:%S %p", "%Y-%m-%d %H:%M:%S"), ("%m/%d/%Y %I:%M %p", "%Y-%m-%d %H:%M:00"),
                      ("%m/%d/%Y", "%Y-%m-%d"), ("%b %d, %Y", "%Y-%m-%d"), ("%B %d, %Y", "%Y-%m-%d"),
-                     ("%m/%d/%y", "%Y-%m-%d")):
+                     ("%m/%d/%y", "%Y-%m-%d"),
+                     ("%b %d, %Y, %I:%M %p", "%Y-%m-%d %H:%M:00"), ("%B %d, %Y, %I:%M %p", "%Y-%m-%d %H:%M:00")):
         try:
             return datetime.strptime(text, fmt).strftime(out)
         except ValueError:

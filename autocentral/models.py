@@ -39,7 +39,8 @@ class InventoryRow:
     detail: str = ""               # module-specific extras: "Meeting 2024-03-05", "12 submissions" ...
     ids: str = ""                  # the site's own IDs as History Log prints them, once matched
     module_label: str = ""         # the name this site gives the module
-    extra: dict = field(default_factory=dict)
+    fields: dict = field(default_factory=dict)   # module's own columns: {"Meeting date": "2024-03-05", ...}
+    extra: dict = field(default_factory=dict)    # internal: history_starts, parent_id ...
 
     @property
     def own_id(self) -> Optional[int]:
@@ -48,6 +49,7 @@ class InventoryRow:
     def as_dict(self) -> dict:
         d = asdict(self)
         d.pop("extra")
+        d.pop("fields")
         d["module"] = self.module_label or self.module
         return d
 
@@ -79,3 +81,4 @@ class ModuleScan:
     rows: list[InventoryRow] = field(default_factory=list)
     problems: list[str] = field(default_factory=list)   # pages that failed, things not read
     seconds: float = 0.0
+    read_at: str = ""          # "YYYY-MM-DD HH:MM" when this module was read
