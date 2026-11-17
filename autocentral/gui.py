@@ -582,9 +582,20 @@ class App:
         self.with_history = tk.BooleanVar(value=True)
         ttk.Checkbutton(top, text="Created info (History Log)", variable=self.with_history).pack(side="right")
 
-        pw = ttk.PanedWindow(self.root, orient="vertical")
-        pw.pack(fill="both", expand=True, **pad)
-        self.nb = ttk.Notebook(pw)
+        # The log is packed first, at the bottom, at a fixed height; the tabs
+        # take all the room that's left.
+        logf = ttk.LabelFrame(self.root, text="Log")
+        logf.pack(side="bottom", fill="x", **pad)
+        ys = ttk.Scrollbar(logf, orient="vertical")
+        self.logbox = tk.Text(logf, height=7, wrap="word", state="disabled", yscrollcommand=ys.set)
+        ys.configure(command=self.logbox.yview)
+        ys.pack(side="right", fill="y")
+        self.logbox.pack(side="left", fill="both", expand=True)
+        self.logbox.tag_configure("warn", foreground="#a15c00")
+        self.logbox.tag_configure("error", foreground="#b00020")
+
+        self.nb = ttk.Notebook(self.root)
+        self.nb.pack(fill="both", expand=True, **pad)
         self.tabs: dict[str, ModuleTab] = {}
         self.overview = OverviewTab(self, self.nb)
         self.nb.add(self.overview.frame, text="Overview")
@@ -592,15 +603,6 @@ class App:
             t = ModuleTab(self, self.nb, m)
             self.tabs[m.key] = t
             self.nb.add(t.frame, text=m.label)
-        pw.add(self.nb, weight=5)
-
-        logf = ttk.LabelFrame(pw, text="Log")
-        self.logbox = tk.Text(logf, height=7, wrap="word", state="disabled")
-        self.logbox.pack(fill="both", expand=True)
-        self.logbox.tag_configure("warn", foreground="#a15c00")
-        self.logbox.tag_configure("error", foreground="#b00020")
-        pw.add(logf, weight=1)
-        self.root.after(50, lambda: pw.sashpos(0, max(300, self.root.winfo_height() - 190)))
 
     # ============================================================ site data
     def host(self) -> str:
