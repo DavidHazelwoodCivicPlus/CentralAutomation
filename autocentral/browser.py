@@ -35,6 +35,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from .reporting import CancelToken, Reporter
 
 WAIT = 15
+UPLOAD_WAIT = 300         # saving an agenda with large files
 ERROR_PAGE_XPATH = "//*[contains(text(), 'An error has occurred')]"
 SESSION_TIMEOUT_MODAL_ID = "cp-session-timeout-modal"
 SESSION_REFRESH_SELECTOR = '[data-session-timeout-action="refresh"]'
@@ -297,6 +298,36 @@ class Browser:
             raise SiteError("The site logged us out (on a sign-in page). Log in again and re-run.")
         if self.on_error_page():
             raise SiteError("The site showed its 'An error has occurred' page.")
+
+    def get_with_retry(self, path: str, ready_css: str, attempts: int = 3) -> None:
+        """Load a page and wait for an element, retrying through the site's
+        intermittent error page with growing back-off."""
+        backoffs = [5, 15, 30]
+        last: Optional[Exception] = None
+        for i in range(attempts):
+            self.cancel.check()
+            try:
+                self.d.get(self.url(path))
+                self.handle_session_timeout()
+                if self.on_login_page():
+                    raise SiteError("Logged out (sign-in page). Log in again and re-run.")
+                if not self.on_error_page():
+                    self.wait_css(ready_css)
+                    return
+                last = SiteError("site error page")
+            except TimeoutException as e:
+                last = e
+            if i < attempts - 1:
+                wait = backoffs[min(i, len(backoffs) - 1)]
+                self.r.warn(f"Page {path} did not load cleanly; retrying in {wait}s ({i + 1}/{attempts}).")
+                self.sleep(wait)
+        raise SiteError(f"Could not load {path}: {last}")
+
+    def run_parser(self, js_body: str, html: str):
+        """Parse HTML with the browser's DOMParser and a small JS function body
+        that receives `doc` and returns plain data."""
+        return self.d.execute_script(
+            "const doc = new DOMParser().parseFromString(arguments[0], 'text/html');" + js_body, html)
 
     def sleep(self, seconds: float) -> None:
         end = time.time() + seconds

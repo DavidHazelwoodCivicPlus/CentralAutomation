@@ -82,6 +82,54 @@ the way the site names that module (e.g. "Bid Postings").
 
 The last read of each module is kept in `cache\<site>\inventory_<module>.json`.
 
+### Agenda Center actions
+
+The Agenda Center tab has an **Agenda Center actions** bar.
+
+**Every action runs as a dry run first.** A run window lists what would
+happen and changes nothing. **Run for real…** unlocks after the dry run, and
+asks you to type the site's address. Every run keeps `results.csv` and
+`undo.json` in `runs\<site>\<time>_dryrun` or `_live`. After a live run, the
+Agenda Center is read again by itself.
+
+**The actions:**
+
+- **Delete ticked / Unpublish ticked / Publish ticked** act on the rows you
+  ticked.
+  - A ticked category means the whole category. For Delete, that includes
+    all its agendas, items, default items, item folders and workflows, which
+    the site requires before it deletes a category.
+  - Published agendas are unpublished before they are deleted.
+  - Publishing always answers Notify Me with **Don't Send**.
+- **Compare with import file…** compares the import workbook
+  (Master_Content_Import.xlsx) with the Agenda Center as read. Optionally it
+  also uses the old site's D10 export (`www-meetings.json`, found by itself
+  when it's next to the workbook or in a folder below it).
+  - The D10 export fills in meeting dates the workbook lacks. It ties
+    complex agendas' items to their meeting by file name. It brings back
+    minutes the workbook dropped: complex agendas lose theirs in the
+    workbook.
+  - Pick the old site's time zone; D10 stores times in UTC.
+  - Each meeting in the file is matched to a site agenda by category,
+    meeting date and description. The results come in tabs:
+    - **Missing**
+    - **Missing minutes** (the agenda is there, without minutes)
+    - **No category on site**
+    - **On site**
+    - **Only on site** (on the site, not in the file)
+  - **Export comparison…** saves the comparison as a spreadsheet, one sheet
+    per tab.
+  - **Upload missing…** uploads the missing agendas (simple, minutes-only
+    and complex) and adds missing minutes to agendas already there. Its
+    options:
+    - publish or leave as drafts;
+    - create missing categories;
+    - download files that aren't in the files folder from the old site
+      (they are saved in `<files folder>\downloaded`).
+
+    Drafts can't take minutes on Central, so a draft agenda that needs
+    minutes is published for it (Don't Send), then put back to draft.
+
 ### The command line
 
 ```
@@ -179,6 +227,11 @@ autocentral/
   historylog.py  History Log search + matching to the table
   inventory.py   filters + spreadsheet export
   store.py       last read of each module, saved per site
+  agendacenter/  Agenda Center actions (from the AutoCentralAgendaCenter tool):
+                 site.py (clicks), plan.py (runner: dry run / live), importdata.py
+                 (import workbook), d10.py (D10 export), compare.py, jobs.py,
+                 folderscan.py (workbook from a folder of files)
+  gui_agenda.py  the Agenda Center actions bar, compare and run windows
   models.py      InventoryRow, HistoryEntry, ModuleScan
   cli.py         command line (scan.bat)
   gui.py         the window: Overview + one tab per module (run.bat)

@@ -67,6 +67,60 @@ first round, because it needs the Pages module.
   shared code then gets built once, and the module quirks show up early.
 - Within a phase, the order of the modules doesn't matter. All 10 have to work
   before the project is done.
+- **Exception (2026-11-17): Agenda Center goes first, through every phase.**
+  A large migration is running now. The API import that brings D10 agendas
+  in misses roughly 10% of them, so Agenda Center needs compare, delete and
+  upload now. The other modules follow the phase order above.
+
+### Roadmap (what the user wants the tool to become)
+
+The tool is for complete site migration of content into Central, and for
+clean-up and QC afterwards. Build every piece so the next ones fit in.
+
+1. **Now: Agenda Center for the migration.**
+   - Compare the import workbook (Master_Content_Import.xlsx, AgendaCenter +
+     AgendaCenterItems sheets) with what is on the site, and list what's
+     missing.
+   - Upload what's missing: agendas, minutes, complex agendas.
+   - Delete agendas, categories, items, folders and workflows in bulk.
+   - Publish and unpublish in bulk.
+2. **Next: every module's content upload.** Each module has its own import
+   instructions (its own sheet in the Content Import workbook: ArchiveCenter,
+   Bids, FAQs, FacilityCenter, FormCenter, NewsFlash, StaffDirectory ...),
+   and its own compare and upload, built the same way as Agenda Center's.
+3. **Later: mass edits across modules (QC).** Open each record (each FAQ,
+   each News Flash ...) and change it in one pass, with a dry run first.
+   Examples:
+   - remove double spaces;
+   - find and replace links, e.g. old-site links to the new internal pages.
+4. **Later: upload from a pile of files.** Given just a folder of agenda and
+   minutes files, the tool works out what goes where:
+   - opens each file and reads it;
+   - finds the meeting date, the category and the meeting type;
+   - pairs agendas with their minutes;
+   - recognises complex agendas (packets, items).
+
+   The Agenda Center tool's folder scan (`agendacenter/folderscan.py`, file
+   names only) is the start of this.
+
+**How that shapes the code:**
+
+- **Per module, the same three parts.** A reader (inventory), an expected-content
+  loader (the module's import sheet, plus the old site's export), and
+  actions. Compare is generic: expected against read.
+- **One job model.** Every change runs as a dry run, then for real after
+  the site address is typed. Every job writes results.csv and undo.json to
+  `runs/<site>/<time>_dryrun|live`. Jobs take plain data, never window
+  objects, so the same job can later run from the command line or from a
+  saved plan.
+- **Old-site exports are inputs too.** The D10 export (www-*.json) is what
+  the import workbook was made from, and it carries what the workbook loses.
+  The York workbook, for example, has no meeting dates and no minutes for
+  complex agendas. Readers for each export type live next to the module
+  that uses them (`agendacenter/d10.py`).
+- **Mass edits** will go through a per-module "open record, change field,
+  save" adapter, with the change described as data (find/replace rules),
+  so one rule can run across every module.
 
 ## 3. Safety rules (non-negotiable)
 
@@ -422,6 +476,19 @@ Still to do in this phase:
 - archived records (Show Archived, which is mostly version history);
 - employees, when a site has staff (Export Staff gives no IDs);
 - training18 and training20.
+
+**Status (2026-11-17), Agenda Center actions:** the Agenda Center tab has
+an Actions bar:
+
+- **Compare with import file**
+- **Delete ticked**
+- **Unpublish ticked**
+- **Publish ticked**
+
+The code comes from the live-tested AutoCentralAgendaCenter tool, now in
+`autocentral/agendacenter/`. The D10 export fills in what the workbook
+lacks. On yorksc, all 554 meetings were dated from www-meetings.json, and
+175 complex agendas got their minutes back.
 
 **What we learned while building:**
 

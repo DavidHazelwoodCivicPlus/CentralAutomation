@@ -29,7 +29,7 @@ from .cli import ROOT, cache_dir, default_out
 from .inventory import RowFilter, export_xlsx
 from .models import InventoryRow, ModuleScan
 from .modules import MODULES, ModuleDef
-from .reporting import CancelToken, Cancelled, Reporter
+from .reporting import CancelToken, Cancelled, Reporter, new_run_dir
 from .scanner import Scanner
 from .store import load_all, save_scan
 
@@ -142,7 +142,7 @@ class ModuleTab:
     def _build(self) -> None:
         f = self.frame
         pad = {"padx": 4, "pady": 3}
-        head = ttk.Frame(f)
+        head = self.head = ttk.Frame(f)
         head.pack(fill="x", **pad)
         self.info = tk.StringVar(value="Not read yet. Click 'Read this module'.")
         ttk.Label(head, textvariable=self.info).pack(side="left")
@@ -550,6 +550,8 @@ class App:
         self.settings = load_settings()
         self.busy = False
         self.loaded_host = ""
+        self.run_windows: dict[int, object] = {}
+        self._then: Optional[Callable[[], None]] = None     # runs once the current job is done
         self.box_images = {False: _box_image(False), True: _box_image(True)}
         self._build()
         self.load_saved()
@@ -603,6 +605,8 @@ class App:
             t = ModuleTab(self, self.nb, m)
             self.tabs[m.key] = t
             self.nb.add(t.frame, text=m.label)
+        from .gui_agenda import AgendaActions
+        self.agenda_actions = AgendaActions(self, self.tabs["agenda"])
 
     # ============================================================ site data
     def host(self) -> str:
@@ -647,6 +651,22 @@ class App:
                     self._module_done(ev[1], ev[2])
                 elif kind == "done":
                     self.log(ev[1])
+                elif kind == "result":
+                    win = self.run_windows.get(ev[1])
+                    if win is not None:
+                        try:
+                            win.add_result(ev[2])
+                        except tk.TclError:        # its window was closed
+                            pass
+                elif kind == "job_done":
+                    win = self.run_windows.pop(ev[1], None)
+                    if win is not None:
+                        try:
+                            win.finished(ev[3])
+                        except tk.TclError:
+                            pass
+                    if ev[2]:                      # a live run changed the site: read it again
+                        self._then = lambda: self.read(["agenda"])
                 elif kind == "idle":
                     self._set_busy(False)
                     for t in self.tabs.values():
@@ -654,6 +674,9 @@ class App:
                             t.reading = False
                             t._update_info()
                     self.overview.refresh()
+                    then, self._then = self._then, None
+                    if then is not None:
+                        then()
         except queue.Empty:
             pass
         self.root.after(150, self._poll)
@@ -677,7 +700,8 @@ class App:
     def _set_busy(self, busy: bool) -> None:
         self.busy = busy
         state = "disabled" if busy else "normal"
-        for b in [self.btn_all, self.btn_login] + [t.btn_read for t in self.tabs.values()]:
+        for b in [self.btn_all, self.btn_login] + [t.btn_read for t in self.tabs.values()] + \
+                self.agenda_actions.buttons:
             b.configure(state=state)
         self.btn_stop.configure(state="normal" if busy else "disabled")
 
@@ -719,10 +743,42 @@ class App:
                                    "or click 'Read all modules'."))
         self._submit(job)
 
-    def read(self, keys: list[str]) -> None:
+    def save(self) -> None:
+        save_settings(self.settings)
+
+    def run_job(self, win, live: bool) -> Optional[Path]:
+        """Run an Agenda Center job (dry run or live) on the worker. Results go
+        to the run window and to runs/<site>/<time>_dryrun|live/results.csv."""
+        from .gui_agenda import RUNS
+        from .agendacenter.jobs import AgendaJobs
+        b = self.worker.browser
+        if b is None or self.busy:
+            win.state.set("Busy or not logged in: wait for the current read or run to finish, then try again.")
+            return None
+        run_dir = new_run_dir(RUNS / b.host, live)
+        ev = self.events
+        wid = id(win)
+        self.run_windows[wid] = win
+        self.log(("LIVE RUN: " if live else "Dry run: ") + win.what)
+
+        def job() -> None:
+            rep = Reporter(on_log=lambda level, msg: ev.put(("log", level, msg)),
+                           on_result=lambda r: ev.put(("result", wid, r)), run_dir=run_dir)
+            ok = False
+            try:
+                win.job(AgendaJobs(self.worker.browser, rep, live))
+                ok = True
+            finally:
+                ev.put(("job_done", wid, live, ok))
+        self._submit(job)
+        return run_dir
+
+    def read(self, keys: list[str], then: Optional[Callable[[], None]] = None) -> None:
         b = self.worker.browser
         if b is None:
             messagebox.showinfo("AutoCentral", "Click 'Open Chrome and log in' first.")
+            return
+        if self.busy:
             return
         if self.host() != b.host:
             messagebox.showinfo("AutoCentral", f"Chrome is logged in to {b.host}, but the Site URL says "
@@ -745,6 +801,7 @@ class App:
             sc.scan(keys, with_history=history)
             ev.put(("done", f"Read {len(keys)} module(s) in {time.monotonic() - t0:.0f}s."))
         self._submit(job)
+        self._then = then
 
     def stop(self) -> None:
         self.worker.cancel.cancel()
