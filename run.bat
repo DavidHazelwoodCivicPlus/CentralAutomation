@@ -9,6 +9,14 @@ if not exist ".venv\Scripts\python.exe" (
   ".venv\Scripts\python.exe" -m pip install --quiet -r requirements.txt || goto :fail
   copy /y requirements.txt ".venv\requirements.installed" >nul
 )
+rem A cut-off install (or security software removing files afterwards) leaves
+rem libraries half there. Check they import, and reinstall them over the top if not.
+".venv\Scripts\python.exe" -c "import selenium.webdriver.common.by, openpyxl, bs4" >nul 2>&1 || (
+  echo Some libraries are missing or incomplete. Reinstalling them...
+  ".venv\Scripts\python.exe" -m pip install --quiet --ignore-installed -r requirements.txt || goto :fail
+  ".venv\Scripts\python.exe" -c "import selenium.webdriver.common.by, openpyxl, bs4" || goto :broken
+  copy /y requirements.txt ".venv\requirements.installed" >nul
+)
 rem Install anything new when requirements.txt has changed since the last install.
 fc /b requirements.txt ".venv\requirements.installed" >nul 2>&1 || (
   echo Installing updated requirements...
@@ -27,5 +35,10 @@ pause
 exit /b 1
 :fail
 echo Installing requirements failed. See the message above.
+pause
+exit /b 1
+:broken
+echo The libraries still don't import after reinstalling. Delete the .venv folder and run this again;
+echo if that fails too, security software may be removing files (selenium includes selenium-manager.exe).
 pause
 exit /b 1
