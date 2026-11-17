@@ -918,6 +918,63 @@ class AgendaCenterSite:
                and a.description.strip() == meeting.description.strip()]
         return max(a.id for a in new) if new else None
 
+    def video_links(self, category: Category, agenda_id: int) -> tuple[str, str]:
+        """(Link to Media, Additional Video Link) as saved on the agenda. Read only."""
+        html = self.b.fetch_text(f"{AGENDA_CENTER}/Agenda/Edit/{agenda_id}?categoryID={category.id}")
+
+        def value(el_id: str) -> str:
+            m = re.search(r'<input[^>]*\bid="' + el_id + r'"[^>]*>', html)
+            v = re.search(r'\bvalue="([^"]*)"', m.group(0)) if m else None
+            return _unescape(v.group(1)).strip() if v else ""
+        return value("txtVideoSource"), value("txtAdditionalVideoSource")
+
+    def edit_and_save(self, category: Category, agenda_id: int, video: Optional[str] = None,
+                      additional: Optional[str] = None) -> str:
+        """Open an agenda's edit page, set Link to Media / Additional Video Link
+        when given, and Save. Saving is also what makes Central build the
+        public HTML page of an item-based (builder) agenda, which an import
+        doesn't do. Notify Me, if it appears, is answered Don't Send. The
+        agenda keeps its status (a draft stays a draft)."""
+        self.b.get_with_retry(f"{AGENDA_CENTER}/Agenda/Edit/{agenda_id}?categoryID={category.id}", "#txtMeetingDate")
+        d = self.b.d
+        for el_id, value in (("txtVideoSource", video), ("txtAdditionalVideoSource", additional)):
+            if value is None:
+                continue
+            els = d.find_elements(By.ID, el_id)
+            if not els:
+                return f"the edit page has no {el_id} field"
+            els[0].clear()
+            if value:
+                els[0].send_keys(value)
+        buttons = d.find_elements(By.ID, "btnSaveAgenda")
+        if not buttons:
+            return "the edit page has no Save button"
+        start = d.current_url
+        btn = buttons[0]
+        self.b.safe_click(btn)
+        self.b.answer_notify_dont_send(appear_timeout=4)
+
+        def done():
+            alert = self.b.take_alert(0.2)
+            if alert is not None:
+                self.b.dismiss_any_alert()
+                raise SiteError(f"Site said: {alert}")
+            if d.current_url != start:
+                return True
+            try:                      # same address, but the page was reloaded
+                btn.is_enabled()
+                return False
+            except Exception:
+                return True
+        self.b.wait_until(done, timeout=UPLOAD_WAIT, poll=1.0)
+        self.b.check_for_problems()
+        if video is not None or additional is not None:
+            got = self.video_links(category, agenda_id)
+            want = (video if video is not None else got[0], additional if additional is not None else got[1])
+            if got != want:
+                return f"saved, but the video links read back as {got}"
+        return "ok"
+
     def add_minutes(self, category: Category, agenda_id: int, minutes_path: Path, publish: bool = True) -> str:
         """ACTIONS > Add Minutes on a PUBLISHED agenda (the site only offers it
         then). Minutes have their own status: publish=True uses Save and

@@ -1,5 +1,6 @@
-"""Agenda Center actions in the window: compare with an import file, upload
-what's missing, and delete / publish / unpublish ticked rows.
+"""Agenda Center actions in the window: the to-do list (post-import tasks
+and saved lists), compare with an import file, upload what's missing, and
+delete / publish / unpublish ticked rows.
 
 Every job runs as a dry run first, in a run window that lists what would
 happen. "Run for real" only unlocks after that dry run, and asks for the
@@ -337,6 +338,7 @@ class AgendaActions:
         box = ttk.LabelFrame(tab.frame, text="Agenda Center actions")
         box.pack(fill="x", padx=4, pady=3, after=tab.head)
         self.buttons = [
+            ttk.Button(box, text="To-do list…", command=lambda: ToDoWindow.show(app)),
             ttk.Button(box, text="Compare with import file…", command=lambda: CompareWindow(app)),
             ttk.Button(box, text="Delete ticked…", command=lambda: self.ticked("delete")),
             ttk.Button(box, text="Unpublish ticked…", command=lambda: self.ticked("unpublish")),
@@ -367,3 +369,280 @@ class AgendaActions:
         else:
             job = lambda jobs, pub=(action == "publish"): jobs.set_published(sel, pub)
         RunWindow(self.app, f"Agenda Center: {action} ticked", what, job)
+
+
+# ================================================================ to-do list
+TODO_FILE = ROOT / "plans" / "_todo.json"
+
+
+class ToDoWindow:
+    """The to-do list: steps that run top to bottom, as one dry run and then
+    for real. Load a post-import tasks file to fill it in, or load a saved
+    list. The list is kept between sessions (plans/_todo.json)."""
+
+    _open: Optional["ToDoWindow"] = None
+
+    @classmethod
+    def show(cls, app) -> "ToDoWindow":
+        if cls._open is not None:
+            try:
+                cls._open.top.deiconify()
+                cls._open.top.lift()
+                return cls._open
+            except tk.TclError:
+                cls._open = None
+        cls._open = cls(app)
+        return cls._open
+
+    def __init__(self, app) -> None:
+        from .agendacenter.plan import Plan
+        self.app = app
+        self.steps = []
+        if TODO_FILE.exists():
+            try:
+                self.steps = list(Plan.load(TODO_FILE).steps)
+            except Exception as e:
+                app.log(f"Couldn't read the saved to-do list: {e}", "warn")
+        self.top = tk.Toplevel(app.root)
+        self.top.title("Agenda Center: to-do list")
+        self.top.geometry("1000x520")
+        pad = {"padx": 6, "pady": 4}
+        ttk.Label(self.top, text="Steps run top to bottom. 'Dry run the list' shows what every step would do; "
+                                 "the run window then offers 'Run for real…'.", foreground="#555").pack(fill="x", **pad)
+        mid = ttk.Frame(self.top)
+        mid.pack(fill="both", expand=True, **pad)
+        self.listbox = tk.Listbox(mid, height=14, selectmode="extended")
+        self.listbox.pack(side="left", fill="both", expand=True)
+        side = ttk.Frame(mid)
+        side.pack(side="left", fill="y", padx=6)
+        for text, cmd in (("Move up", lambda: self.move(-1)), ("Move down", lambda: self.move(1)),
+                          ("Remove", self.remove), ("Clear", self.clear)):
+            ttk.Button(side, text=text, command=cmd).pack(fill="x", pady=2)
+        add = ttk.LabelFrame(self.top, text="Add to the list")
+        add.pack(fill="x", **pad)
+        ttk.Button(add, text="Add from post-import tasks file…", command=lambda: TasksDialog(app, self)).pack(
+            side="left", padx=4, pady=4)
+        ttk.Label(add, text="The D10-to-Central Migration Tool's <site>-agenda-center-post-import-tasks.json "
+                            "(the .csv works too, minus the meetings to create by hand).",
+                  foreground="#777").pack(side="left", padx=8)
+        bot = ttk.Frame(self.top)
+        bot.pack(fill="x", **pad)
+        self.btn_run = ttk.Button(bot, text="Dry run the list", command=self.dry_run)
+        self.btn_run.pack(side="left")
+        ttk.Button(bot, text="Save list…", command=self.save_as).pack(side="left", padx=6)
+        ttk.Button(bot, text="Load list…", command=self.load).pack(side="left")
+        ttk.Button(bot, text="Undo a live run…", command=self.undo).pack(side="left", padx=16)
+        ttk.Button(bot, text="Close", command=self.top.destroy).pack(side="right")
+        self.refresh()
+
+    # -------------------------------------------------------------- list
+    def refresh(self) -> None:
+        self.listbox.delete(0, "end")
+        for i, s in enumerate(self.steps, 1):
+            self.listbox.insert("end", f"{i}. {s.describe()}")
+        self._persist()
+
+    def _persist(self) -> None:
+        from .agendacenter.plan import Plan
+        try:
+            Plan(name="To-do list", site_url=self.app.site.get(), steps=self.steps).save(TODO_FILE)
+        except OSError:
+            pass
+
+    def add_steps(self, step_dicts: list[dict]) -> None:
+        from .agendacenter.plan import Step
+        self.steps += [Step.from_dict(d) for d in step_dicts]
+        self.refresh()
+        self.app.log(f"Added {len(step_dicts)} step(s) to the to-do list.")
+
+    def move(self, d: int) -> None:
+        sel = self.listbox.curselection()
+        if len(sel) != 1:
+            return
+        i, j = sel[0], sel[0] + d
+        if 0 <= j < len(self.steps):
+            self.steps[i], self.steps[j] = self.steps[j], self.steps[i]
+            self.refresh()
+            self.listbox.selection_set(j)
+
+    def remove(self) -> None:
+        for i in reversed(self.listbox.curselection()):
+            del self.steps[i]
+        self.refresh()
+
+    def clear(self) -> None:
+        if self.steps and messagebox.askyesno("To-do list", "Remove every step?", parent=self.top):
+            self.steps.clear()
+            self.refresh()
+
+    def plan(self):
+        from .agendacenter.plan import Plan
+        return Plan(name="To-do list", site_url=self.app.site.get(), steps=list(self.steps))
+
+    # --------------------------------------------------------------- run
+    def dry_run(self) -> None:
+        if not self.steps:
+            messagebox.showinfo("To-do list", "The list is empty.", parent=self.top)
+            return
+        if self.app.worker.browser is None:
+            messagebox.showinfo("To-do list", "Log in first (Open Chrome and log in).", parent=self.top)
+            return
+        plan = self.plan()
+        try:
+            plan.validate()
+        except ValueError as e:
+            messagebox.showerror("To-do list", str(e), parent=self.top)
+            return
+        what = "To-do list:\n" + "\n".join(f"{i}. {s.describe()}" for i, s in enumerate(plan.steps, 1))
+        RunWindow(self.app, "Agenda Center: to-do list", what, lambda jobs: jobs.runner.run(plan))
+
+    # -------------------------------------------------------------- files
+    def save_as(self) -> None:
+        if not self.steps:
+            return
+        folder = ROOT / "plans"
+        folder.mkdir(exist_ok=True)
+        p = filedialog.asksaveasfilename(parent=self.top, initialdir=str(folder), defaultextension=".json",
+                                         initialfile="to-do list.json", filetypes=[("To-do list", "*.json")])
+        if p:
+            self.plan().save(Path(p))
+            self.app.log(f"Saved the to-do list to {p}")
+
+    def load(self) -> None:
+        from .agendacenter.plan import Plan
+        p = filedialog.askopenfilename(parent=self.top, initialdir=str(ROOT / "plans"),
+                                       filetypes=[("To-do list", "*.json")])
+        if not p:
+            return
+        try:
+            plan = Plan.load(Path(p))
+        except Exception as e:
+            messagebox.showerror("Load list", str(e), parent=self.top)
+            return
+        self.steps = list(plan.steps)
+        self.refresh()
+
+    def undo(self) -> None:
+        from .agendacenter.plan import undo_plan
+        p = filedialog.askopenfilename(parent=self.top, initialdir=str(RUNS), title="undo.json from a live run",
+                                       filetypes=[("Undo file", "undo.json")])
+        if not p:
+            return
+        plan = undo_plan(Path(p))
+        if not plan.steps:
+            messagebox.showinfo("Undo", "That run has nothing to undo.", parent=self.top)
+            return
+        if self.steps and not messagebox.askyesno("Undo", "Replace the current list with the undo steps?",
+                                                  parent=self.top):
+            return
+        self.steps = list(plan.steps)
+        self.refresh()
+
+
+class TasksDialog:
+    """Pick a post-import tasks file and the files folder; adds the steps."""
+
+    def __init__(self, app, todo: ToDoWindow) -> None:
+        from .agendacenter.tasks import KIND_LABELS, KINDS
+        self.app, self.todo = app, todo
+        s = app.settings.get("post_import", {})
+        self.top = tk.Toplevel(todo.top)
+        self.top.title("Add post-import tasks")
+        self.top.geometry("1000x430")
+        self.top.transient(todo.top)
+        pad = {"padx": 6, "pady": 3}
+        f = ttk.Frame(self.top)
+        f.pack(fill="x", **pad)
+        self.tasks_file = tk.StringVar(value=s.get("tasks_file", ""))
+        self.files_dir = tk.StringVar(value=s.get("files_dir", ""))
+        for row, (label, var, cmd) in enumerate((
+                ("Post-import tasks file (.json)", self.tasks_file, self.pick_tasks),
+                ("Downloaded files folder", self.files_dir, self.pick_dir))):
+            ttk.Label(f, text=label).grid(row=row, column=0, sticky="e", padx=4, pady=2)
+            ttk.Entry(f, textvariable=var, width=95).grid(row=row, column=1, sticky="w")
+            ttk.Button(f, text="Browse…", command=cmd).grid(row=row, column=2, padx=4)
+        ttk.Label(f, text="Files are looked for in that folder, its <site>-agenda-center-attach-after-import "
+                          "folder and anything below it.", foreground="#777").grid(row=2, column=1, sticky="w")
+        self.summary = tk.StringVar(value="")
+        ttk.Label(self.top, textvariable=self.summary, wraplength=950, justify="left").pack(fill="x", **pad)
+        kinds = ttk.LabelFrame(self.top, text="Do")
+        kinds.pack(fill="x", **pad)
+        self.kind_vars = {}
+        self.create_cats = tk.BooleanVar(value=True)
+        ttk.Checkbutton(kinds, text="Create the categories in the file that aren't on the site (published)",
+                        variable=self.create_cats).pack(anchor="w")
+        for k in KINDS:
+            v = tk.BooleanVar(value=True)
+            self.kind_vars[k] = v
+            label = KIND_LABELS[k]
+            ttk.Checkbutton(kinds, text=label[0].upper() + label[1:], variable=v).pack(anchor="w")
+        opts = ttk.LabelFrame(self.top, text="Options")
+        opts.pack(fill="x", **pad)
+        self.publish = tk.BooleanVar(value=bool(s.get("publish", True)))
+        self.download = tk.BooleanVar(value=bool(s.get("download", False)))
+        ttk.Checkbutton(opts, text="Publish new meetings and minutes (Notify Me is always answered Don't Send)",
+                        variable=self.publish).pack(anchor="w")
+        ttk.Checkbutton(opts, text="Download files that aren't in the folder from the old site",
+                        variable=self.download).pack(anchor="w")
+        bar = ttk.Frame(self.top)
+        bar.pack(fill="x", **pad)
+        ttk.Button(bar, text="Add to the to-do list", command=self.add).pack(side="left")
+        ttk.Button(bar, text="Cancel", command=self.top.destroy).pack(side="right")
+        if self.tasks_file.get():
+            self.load_summary()
+
+    def pick_tasks(self) -> None:
+        start = str(Path(self.tasks_file.get()).parent) if self.tasks_file.get() else None
+        p = filedialog.askopenfilename(parent=self.top, filetypes=[("Post-import tasks", "*.json *.csv")],
+                                       initialdir=start)
+        if p:
+            self.tasks_file.set(p)
+            if not self.files_dir.get():
+                self.files_dir.set(str(Path(p).parent))
+            self.load_summary()
+
+    def pick_dir(self) -> None:
+        p = filedialog.askdirectory(parent=self.top, initialdir=self.files_dir.get() or None)
+        if p:
+            self.files_dir.set(p)
+
+    def load_summary(self):
+        from .agendacenter.tasks import KIND_LABELS, categories, counts, load_tasks
+        try:
+            tasks, warnings = load_tasks(Path(self.tasks_file.get()))
+        except Exception as e:
+            self.summary.set(f"Couldn't read the tasks file: {e}")
+            return None
+        c = counts(tasks)
+        text = (f"{len(tasks)} meeting(s) in {len(categories(tasks))} categories: "
+                + ", ".join(f"{c[k]} to {KIND_LABELS[k].split(' (')[0]}" for k in c) + ".")
+        if warnings:
+            text += "  " + " ".join(warnings)
+        self.summary.set(text)
+        return tasks
+
+    def add(self) -> None:
+        from .agendacenter.tasks import todo_steps
+        tasks_file = Path(self.tasks_file.get())
+        if not tasks_file.is_file():
+            messagebox.showinfo("Post-import tasks", "Pick the tasks file first.", parent=self.top)
+            return
+        files_dir = Path(self.files_dir.get()) if self.files_dir.get().strip() else tasks_file.parent
+        if not files_dir.is_dir():
+            messagebox.showinfo("Post-import tasks", f"Folder not found: {files_dir}", parent=self.top)
+            return
+        tasks = self.load_summary()
+        if tasks is None:
+            return
+        kinds = [k for k, v in self.kind_vars.items() if v.get()]
+        steps = todo_steps(tasks_file, files_dir, tasks, publish=self.publish.get(),
+                           download_missing=self.download.get(), create_categories=self.create_cats.get(),
+                           kinds=kinds)
+        if not steps:
+            messagebox.showinfo("Post-import tasks", "Nothing to add with these choices.", parent=self.top)
+            return
+        self.app.settings["post_import"] = {"tasks_file": str(tasks_file), "files_dir": str(files_dir),
+                                            "publish": self.publish.get(), "download": self.download.get()}
+        self.app.save()
+        self.todo.add_steps(steps)
+        self.top.destroy()

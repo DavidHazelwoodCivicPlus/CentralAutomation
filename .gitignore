@@ -5,3 +5,4 @@ inventories/
 runs/
 settings.json
 cache/
+plans/_todo.json

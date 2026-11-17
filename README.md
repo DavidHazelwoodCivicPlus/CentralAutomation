@@ -130,6 +130,48 @@ Agenda Center is read again by itself.
     Drafts can't take minutes on Central, so a draft agenda that needs
     minutes is published for it (Don't Send), then put back to draft.
 
+### To-do list (finishing what the importer can't)
+
+**Agenda Center actions → To-do list…** opens the to-do list. It's the Plan
+tab of the old Agenda Center tool: steps that run top to bottom, as one dry
+run and then for real. **Save list… / Load list…** keep lists as JSON
+files. **Undo a live run…** turns a run's `undo.json` into steps that
+reverse it. The list stays between sessions.
+
+**Add from post-import tasks file…** reads the D10-to-Central Migration
+Tool's `<site>-agenda-center-post-import-tasks.json` (step 6 of that tool,
+"Finish what the importer can't do"). Pick that file, and the folder you
+downloaded the files to. The tool adds these steps, in this order:
+
+1. **Create categories** named in the file that aren't on the site.
+2. **Create the meetings the importer couldn't** (`create-meeting-manually`:
+   meetings that share a category and date with another). Each is built
+   from the file's own description: an agenda file with or without minutes,
+   items with or without minutes, or minutes only.
+3. **Attach minutes** (`attach-minutes`) with Add Minutes. Agendas that
+   already have minutes are skipped. A draft agenda is published for it
+   (Don't Send) and put back to draft.
+4. **Add video links** (`add-media-links`): Link to Media and Additional
+   Video Link on the agenda's edit page. Further links have no field on
+   Central; they're listed in the results.
+5. **Open and save** item-based agendas (`save-to-build-html`). Central
+   only builds their public agenda page on a save; until then the link is a
+   404. An agenda already saved for its video links isn't saved again.
+
+**How it works:**
+
+- **Finding meetings.** A meeting is found on the site by category, meeting
+  date and the description as imported. When only one agenda is on that
+  date, the description may differ. Anything that can't be found, or is
+  ambiguous, is listed as an error and left alone.
+- **Finding files.** Files are looked for in the folder you pick, its
+  `<site>-agenda-center-attach-after-import` folder, and anywhere below it.
+  With **Download files that aren't in the folder from the old site**, a
+  missing file is fetched from the address in the tasks file into
+  `<folder>\downloaded`.
+- **The CSV version** of the tasks file works too, but it doesn't describe
+  the meetings to create by hand, so step 2 needs the JSON.
+
 ### The command line
 
 ```
@@ -230,6 +272,7 @@ autocentral/
   agendacenter/  Agenda Center actions (from the AutoCentralAgendaCenter tool):
                  site.py (clicks), plan.py (runner: dry run / live), importdata.py
                  (import workbook), d10.py (D10 export), compare.py, jobs.py,
+                 tasks.py (migration tool's post-import tasks -> to-do steps),
                  folderscan.py (workbook from a folder of files)
   gui_agenda.py  the Agenda Center actions bar, compare and run windows
   models.py      InventoryRow, HistoryEntry, ModuleScan

@@ -490,6 +490,27 @@ The code comes from the live-tested AutoCentralAgendaCenter tool, now in
 lacks. On yorksc, all 554 meetings were dated from www-meetings.json, and
 175 complex agendas got their minutes back.
 
+**Status (2026-11-17), post-import tasks:**
+
+- **Where content goes missing.** The D10-to-Central Migration Tool (a
+  single HTML page; Agenda Center code around `acBuildRows`) leaves out of
+  the workbook what Central's importer can't take, on purpose, and lists it
+  as post-import tasks:
+  - `create-meeting-manually`
+  - `attach-minutes`
+  - `add-media-links`
+  - `save-to-build-html`
+
+  Done by hand, these are where the "missing ~10%" comes from. Columbia
+  alone has 798 meetings with follow-up tasks.
+- **The to-do list.** The Agenda Center tab now has the old tool's to-do
+  list. Loading the tasks file fills it in, and the runner does every task
+  (`plan.py`, step `post_import_tasks`).
+- **New site action:** `edit_and_save` (video links, and the save that
+  builds the public page).
+- **Not yet proven live:** `edit_and_save` on an existing agenda, and
+  whether Central's public agenda page appears after the save.
+
 **What we learned while building:**
 
 - **First History Log row, not just Create.** Archive Center logs new items
