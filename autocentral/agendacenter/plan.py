@@ -545,6 +545,7 @@ class Runner:
 
             existing = self.site.agendas(cat) if cat else []
             created: list[int] = []
+            resumed: list[int] = []           # drafts an earlier, stopped run left
             needs_minutes: list[tuple[int, Meeting]] = []
             failures = 0
             for m in group:
@@ -558,7 +559,16 @@ class Runner:
                     dup = next((a for a in existing if a.meeting_date == m.meeting_date
                                 and is_duplicate(m, a, self.site.details)), None)
                     if dup is not None:
-                        self._meeting_res(label, m, "skipped", f"already on the site as agenda {dup.id}")
+                        # A run stopped between creating and publishing leaves a
+                        # draft (seen live 2026-11-17): finish it on the rerun.
+                        unfinished = self.live and publish and not dup.published
+                        late = self.live and m.later_minutes and not dup.has_minutes
+                        if unfinished or late:
+                            resumed.append(dup.id)
+                            if late:
+                                needs_minutes.append((dup.id, m))
+                        self._meeting_res(label, m, "skipped", f"already on the site as agenda {dup.id}"
+                                          + ("; finishing its publish/minutes" if unfinished or late else ""))
                         continue
                 if not self.live:
                     self._meeting_res(label, m, "dry-run", f"would create {m.kind} agenda"
@@ -585,15 +595,16 @@ class Runner:
                     self.r.error(f"{failures} uploads in a row failed in {cat_name}; moving on.")
                     break
 
-            if not self.live or not created:
+            if not self.live or not (created or resumed):
                 continue
             # Minutes can only be added to a published agenda, so agendas that get
             # minutes later are published even on a draft upload, then unpublished.
-            to_publish = set(created) if publish else {i for i, _ in needs_minutes}
+            to_publish = set(created + resumed) if publish else {i for i, _ in needs_minutes}
             if to_publish:
                 self.r.info(f"{cat_name}: publishing {len(to_publish)} new agenda(s) (Notify Me: Don't Send)")
-                fresh = [a for a in self.site.agendas(cat) if a.id in to_publish and not a.published]
-                published_ok = self._bulk(label, "publish", fresh)
+                now = [a for a in self.site.agendas(cat) if a.id in to_publish]
+                fresh = [a for a in now if not a.published]
+                published_ok = self._bulk(label, "publish", fresh) | {a.id for a in now if a.published}
             else:
                 published_ok = set()
             for agenda_id, m in needs_minutes:

@@ -12,7 +12,8 @@ import time
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import (StaleElementReferenceException, TimeoutException,
+                                        UnexpectedAlertPresentException)
 from selenium.webdriver.common.by import By
 
 from ..browser import UPLOAD_WAIT, WAIT, Browser, SiteError
@@ -459,9 +460,18 @@ class AgendaCenterSite:
         if existing:
             return existing, "already exists"
         self.b.get_with_retry(f"{AGENDA_CENTER}/Category/Edit/0", "#txtTitle")
-        title = self.b.d.find_element(By.ID, "txtTitle")
-        title.clear()
-        title.send_keys(name)
+        # The page's own start-up script empties Name if we type too soon
+        # (seen live 2026-11-17): type, then check it's still there.
+        for _ in range(5):
+            self.b.sleep(1.0)
+            title = self.b.d.find_element(By.ID, "txtTitle")
+            title.clear()
+            title.send_keys(name)
+            self.b.sleep(1.0)
+            if self.b.d.find_element(By.ID, "txtTitle").get_attribute("value") == name:
+                break
+        else:
+            return None, "the Name box kept clearing; nothing saved"
         wanted = "saveChanges('publish')" if publish else "saveChanges('save')"
         btn = next((a for a in self.b.d.find_elements(By.CSS_SELECTOR, "a.button")
                     if wanted in (a.get_attribute("onclick") or "")), None)
@@ -928,6 +938,28 @@ class AgendaCenterSite:
             return _unescape(v.group(1)).strip() if v else ""
         return value("txtVideoSource"), value("txtAdditionalVideoSource")
 
+    def _answer_amended_dont_show(self, appear_timeout: float = 4.0) -> Optional[str]:
+        """If the Amended Agenda pop-up appears, click Don't Show as Amended.
+        Returns None when answered or not shown, else what went wrong."""
+        d = self.b.d
+
+        def modal():
+            for m in d.find_elements(By.CSS_SELECTOR, ".modalAmendedAgenda"):
+                if m.is_displayed():
+                    return m
+            return None
+        try:
+            m = self.b.wait_until(modal, timeout=appear_timeout, poll=0.3)
+        except TimeoutException:
+            return None
+        for a in m.find_elements(By.CSS_SELECTOR, ".buttons a"):
+            onclick = (a.get_attribute("onclick") or "").replace(" ", "")
+            if "amendmentModalCallback(false)" in onclick and "don't show" in a.text.lower().replace("’", "'"):
+                self.b.js_click(a)
+                self.r.info("Amended Agenda pop-up answered: Don't Show as Amended.")
+                return None
+        return "the Amended Agenda pop-up had no Don't Show as Amended button; nothing saved"
+
     def edit_and_save(self, category: Category, agenda_id: int, video: Optional[str] = None,
                       additional: Optional[str] = None) -> str:
         """Open an agenda's edit page, set Link to Media / Additional Video Link
@@ -946,27 +978,69 @@ class AgendaCenterSite:
             els[0].clear()
             if value:
                 els[0].send_keys(value)
+        # Imports stamp Posted date with the import time, and the edit page
+        # won't save a Posted date after the Meeting date (seen live
+        # 2026-11-17). Move it back to the meeting date.
+        posted, meeting = d.find_elements(By.ID, "Agenda_PostedDate"), d.find_elements(By.ID, "txtMeetingDate")
+        if posted and meeting:
+            pv, mv = posted[0].get_attribute("value") or "", meeting[0].get_attribute("value") or ""
+            pd, md = _mdy(pv), _mdy(mv)
+            if pd and md and pd > md:
+                posted[0].clear()
+                posted[0].send_keys(mv)
+                if (posted[0].get_attribute("value") or "") != mv:
+                    return f"couldn't move Posted date {pv} back to the meeting date {mv}; nothing saved"
+                self.r.info(f"Agenda {agenda_id}: Posted date {pv} is after the meeting; set to {mv}.")
         buttons = d.find_elements(By.ID, "btnSaveAgenda")
         if not buttons:
             return "the edit page has no Save button"
         start = d.current_url
         btn = buttons[0]
         self.b.safe_click(btn)
-        self.b.answer_notify_dont_send(appear_timeout=4)
+        # Saving a published agenda first asks "show as amended?" (seen live
+        # 2026-11-17). A migration fix-up isn't an amendment: Don't Show.
+        problem = self._answer_amended_dont_show(appear_timeout=4)
+        if problem:
+            return problem
+
+        # A plain Save never opens Notify Me (only Publish/Send do), so it's
+        # answered from inside the wait rather than waited for: waiting for it
+        # used to swallow the site's validation alert and call the save ok.
+        rss_answered: list = []
 
         def done():
-            alert = self.b.take_alert(0.2)
+            try:
+                alert = self.b.take_alert(0.2)
+            except UnexpectedAlertPresentException as e:
+                alert = e.alert_text or "an alert"
             if alert is not None:
                 self.b.dismiss_any_alert()
+                if "rss feed" in alert.lower():
+                    # "Include this in the RSS feed? OK/Cancel": Cancel keeps
+                    # old meetings out of the feed (like Notify Me: Don't
+                    # Send) and the save carries on.
+                    rss_answered.append(1)
+                    return False
                 raise SiteError(f"Site said: {alert}")
-            if d.current_url != start:
-                return True
-            try:                      # same address, but the page was reloaded
+            try:
+                if d.current_url != start:
+                    return True
+                if self.b.notify_modal_open():
+                    self.b.answer_notify_dont_send(appear_timeout=1)
+                    return False
                 btn.is_enabled()
                 return False
-            except Exception:
-                return True
-        self.b.wait_until(done, timeout=UPLOAD_WAIT, poll=1.0)
+            except StaleElementReferenceException:
+                return True           # same address, but the page was reloaded
+            except UnexpectedAlertPresentException as e:
+                self.b.dismiss_any_alert()
+                raise SiteError(f"Site said: {e.alert_text or 'an alert'}")
+        try:
+            self.b.wait_until(done, timeout=UPLOAD_WAIT, poll=1.0)
+        except TimeoutException:
+            return "the page didn't reload after Save; it may not have saved"
+        if rss_answered:
+            self.r.info("RSS feed question answered: Cancel (not added to the feed).")
         self.b.check_for_problems()
         if video is not None or additional is not None:
             got = self.video_links(category, agenda_id)
@@ -1016,3 +1090,12 @@ class AgendaCenterSite:
 def _unescape(s: str) -> str:
     return (s.replace("&amp;", "&").replace("&#39;", "'").replace("&quot;", '"')
             .replace("&lt;", "<").replace("&gt;", ">"))
+
+
+def _mdy(text: str):
+    """MM/DD/YYYY from an edit page date box, or None."""
+    import datetime as _dt
+    try:
+        return _dt.datetime.strptime(text.strip(), "%m/%d/%Y").date()
+    except ValueError:
+        return None

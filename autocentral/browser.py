@@ -25,6 +25,7 @@ from selenium.common.exceptions import (
     NoSuchElementException,
     StaleElementReferenceException,
     TimeoutException,
+    UnexpectedAlertPresentException,
     WebDriverException,
 )
 from selenium.webdriver.common.by import By
@@ -275,6 +276,12 @@ class Browser:
             self.js_click(btn)
             self.r.info("Session-timeout prompt appeared; clicked Refresh Session.")
             time.sleep(1.0)
+            try:
+                text = self.d.switch_to.alert.text
+                if _is_stray_alert(text):
+                    self.d.switch_to.alert.accept()
+            except NoAlertPresentException:
+                pass
             return True
         except (NoSuchElementException, StaleElementReferenceException, WebDriverException):
             return False
@@ -453,6 +460,24 @@ class Browser:
         if final.netloc and final.netloc.lower() != self.host:
             raise SiteError("A page was redirected off-site (logged out?). Log in again and re-run.")
 
+    def _script_past_stray_alerts(self, script: str, *args):
+        """execute_script, getting past the alerts a long background read can
+        meet: the page's own idle timer (it doesn't see fetches) shows the
+        Session Timeout box, and its Refresh Session can raise "Popup was
+        blocked" (seen live 2026-11-17; the session itself was still fine).
+        Any other alert is a real problem and stops the read."""
+        for _ in range(5):
+            try:
+                self.handle_session_timeout()
+                return self.d.execute_script(script, *args)
+            except UnexpectedAlertPresentException as e:
+                text = self.dismiss_any_alert() or e.alert_text or ""
+                if not _is_stray_alert(text):
+                    raise SiteError(f"Site said: {text}")
+                self.r.info(f"Cleared a stray site alert ({text[:60]}); carrying on.")
+                time.sleep(1.0)
+        return self.d.execute_script(script, *args)
+
     def _run_background(self, body: str, *args, timeout: float = 600.0):
         """Start `body` in the page without waiting, then check on it twice a
         second. Long reads don't hit Selenium's 120 s command limit, and Stop
@@ -464,7 +489,7 @@ class Browser:
                    "const __state = window.__ac[__t] = {done: false, cancel: false, progress: 0};"
                    "const done = v => { __state.value = v; __state.done = true; };"
                    + body + "\nreturn __t;")
-        token = self.d.execute_script(starter, *args)
+        token = self._script_past_stray_alerts(starter, *args)
         poll = ("const s = (window.__ac || {})[arguments[0]];"
                 "if (!s) return {gone: true};"
                 "if (arguments[1]) s.cancel = true;"
@@ -475,7 +500,7 @@ class Browser:
         while True:
             time.sleep(0.5)
             stop = self.cancel.cancelled
-            state = self.d.execute_script(poll, token, stop)
+            state = self._script_past_stray_alerts(poll, token, stop)
             if state.get("gone"):
                 raise SiteError("The browser page changed while reading (did the tab navigate?). Run the scan again.")
             if state.get("done"):
@@ -523,7 +548,13 @@ class Browser:
         return base64.b64decode(r["b64"]), r.get("type", "")
 
     def fetch_text(self, path: str) -> str:
-        r = self.fetch_many([path])[0]
+        # HTTP 0 = no answer (network blip, page navigating); seen once in a
+        # long live run 2026-11-17. Retry those; real HTTP errors fail at once.
+        for attempt in range(4):
+            r = self.fetch_many([path])[0]
+            if r.get("ok") or r.get("status") not in (0, None):
+                break
+            self.sleep(5 * (attempt + 1))
         if not r.get("ok"):
             raise SiteError(f"Fetch {path} failed: HTTP {r.get('status')}")
         return r["text"]
@@ -556,3 +587,8 @@ class Browser:
         for r in res:
             self._check_host(r.get("url"))
         return res
+
+
+def _is_stray_alert(text: str) -> bool:
+    t = (text or "").lower()
+    return "popup was blocked" in t or "session" in t
