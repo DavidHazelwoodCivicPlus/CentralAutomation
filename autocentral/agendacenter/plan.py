@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Optional
 
 from .filters import AgendaFilter, ItemFilter, _d, select_agendas, select_items
-from .importdata import ImportOptions, check_workbook, files_search, find_file, is_duplicate, load_meetings
+from .importdata import ImportOptions, check_workbook, files_search, find_file, search_dirs_for, is_duplicate, load_meetings
 from .models import ALL_KINDS, Agenda, Category, Item, Meeting
 from ..reporting import ActionResult, Reporter
 from .site import AgendaCenterSite
@@ -489,7 +489,7 @@ class Runner:
         folders); with download_missing, fetches a file it can't find from
         where the old (D10) site served it, into <files folder>/downloaded."""
         files_dir, deep = files_search(opts)
-        search_dirs = [p for p in [files_dir] if p]
+        search_dirs = search_dirs_for(opts, files_dir)
         if opts.json_path:
             jdir = Path(opts.json_path).parent
             search_dirs += [jdir / t[len("files in: "):] for m in meetings for t in m.json_tasks

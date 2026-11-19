@@ -11,10 +11,10 @@ if not exist ".venv\Scripts\python.exe" (
 )
 rem A cut-off install (or security software removing files afterwards) leaves
 rem libraries half there. Check they import, and reinstall them over the top if not.
-".venv\Scripts\python.exe" -c "import selenium.webdriver.common.by, openpyxl, bs4" >nul 2>&1 || (
+".venv\Scripts\python.exe" -c "import selenium.webdriver.common.by, selenium.webdriver.remote.webelement, selenium.webdriver.chrome.options, openpyxl, bs4" >nul 2>&1 || (
   echo Some libraries are missing or incomplete. Reinstalling them...
   ".venv\Scripts\python.exe" -m pip install --quiet --ignore-installed -r requirements.txt || goto :fail
-  ".venv\Scripts\python.exe" -c "import selenium.webdriver.common.by, openpyxl, bs4" || goto :broken
+  ".venv\Scripts\python.exe" -c "import selenium.webdriver.common.by, selenium.webdriver.remote.webelement, selenium.webdriver.chrome.options, openpyxl, bs4" || goto :broken
   copy /y requirements.txt ".venv\requirements.installed" >nul
 )
 rem Install anything new when requirements.txt has changed since the last install.

@@ -212,6 +212,52 @@ def todo_steps(tasks_file: Path, files_dir: Optional[Path], tasks: list[PostTask
     return steps
 
 
+NAME_HEADERS = ("name", "category", "category name", "categoryname", "title")
+
+
+def load_category_names(path: Path) -> tuple[list[str], list[str]]:
+    """Category names from a .csv or .xlsx, such as the migration tool's
+    <site>-agenda-center-categories.csv: the column headed Name (or
+    Category / Category Name / Title), else the first column. Blank and
+    repeated names (ignoring case) are dropped. Returns (names, warnings)."""
+    path = Path(path)
+    if path.suffix.lower() in (".xlsx", ".xlsm"):
+        import openpyxl
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        try:
+            rows = [["" if v is None else str(v) for v in r] for r in wb.worksheets[0].iter_rows(values_only=True)]
+        finally:
+            wb.close()
+    elif path.suffix.lower() in (".csv", ".txt"):
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            rows = list(csv.reader(f))
+    else:
+        raise ValueError(f"Pick a .csv or .xlsx file, not {path.suffix or 'a file with no extension'}.")
+    rows = [r for r in rows if any(c.strip() for c in r)]
+    if not rows:
+        return [], ["The file is empty."]
+    warnings: list[str] = []
+    head = [c.strip().lower() for c in rows[0]]
+    col = next((head.index(h) for h in NAME_HEADERS if h in head), None)
+    if col is None:
+        col = 0
+        warnings.append("No Name column found; using the first column, header row included.")
+        body = rows
+    else:
+        body = rows[1:]
+    names: list[str] = []
+    seen: set[str] = set()
+    for r in body:
+        name = re.sub(r"\s+", " ", r[col] if col < len(r) else "").strip()
+        if not name:
+            continue
+        if name.lower() in seen:
+            warnings.append(f"'{name}' is listed more than once; it's created once.")
+            continue
+        seen.add(name.lower())
+        names.append(name)
+    return names, warnings
+
 # ------------------------------------------------------- No Agenda template
 def no_agenda_template_pdf() -> bytes:
     """The migration tool's one-page "No Agenda" PDF (same text), for any

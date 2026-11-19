@@ -422,9 +422,11 @@ class ToDoWindow:
         add.pack(fill="x", **pad)
         ttk.Button(add, text="Add from post-import tasks file…", command=lambda: TasksDialog(app, self)).pack(
             side="left", padx=4, pady=4)
-        ttk.Label(add, text="The D10-to-Central Migration Tool's <site>-agenda-center-post-import-tasks.json "
-                            "(the .csv works too, minus the meetings to create by hand).",
-                  foreground="#777").pack(side="left", padx=8)
+        ttk.Button(add, text="Add categories from file…", command=self.add_categories_file).pack(
+            side="left", padx=4, pady=4)
+        ttk.Label(add, text="Tasks: the D10-to-Central Migration Tool's <site>-agenda-center-post-import-tasks.json. "
+                            "Categories: a .csv or .xlsx with a Name column, such as <site>-agenda-center-categories.csv.",
+                  foreground="#777", wraplength=620, justify="left").pack(side="left", padx=8)
         bot = ttk.Frame(self.top)
         bot.pack(fill="x", **pad)
         self.btn_run = ttk.Button(bot, text="Dry run the list", command=self.dry_run)
@@ -454,6 +456,31 @@ class ToDoWindow:
         self.steps += [Step.from_dict(d) for d in step_dicts]
         self.refresh()
         self.app.log(f"Added {len(step_dicts)} step(s) to the to-do list.")
+
+    def add_categories_file(self) -> None:
+        """Create the categories listed in a .csv/.xlsx (Name column)."""
+        from .agendacenter.tasks import load_category_names
+        p = filedialog.askopenfilename(parent=self.top, title="Categories file",
+                                       filetypes=[("Categories", "*.csv *.xlsx"), ("All files", "*.*")])
+        if not p:
+            return
+        try:
+            names, warnings = load_category_names(Path(p))
+        except Exception as e:
+            messagebox.showerror("Categories file", f"Couldn't read {Path(p).name}: {e}", parent=self.top)
+            return
+        if not names:
+            messagebox.showinfo("Categories file", "No category names found in that file.", parent=self.top)
+            return
+        shown = "\n".join(names[:25]) + (f"\n... and {len(names) - 25} more" if len(names) > 25 else "")
+        extra = ("\n\n" + "\n".join(warnings[:5])) if warnings else ""
+        answer = messagebox.askyesnocancel(
+            "Categories file", f"{len(names)} categor{'y' if len(names) == 1 else 'ies'} in {Path(p).name}:\n\n"
+            f"{shown}{extra}\n\nCategories already on the site are skipped.\n"
+            "Publish the new categories? (Yes = published, No = draft)", parent=self.top)
+        if answer is None:
+            return
+        self.add_steps([{"action": "create_categories", "names": names, "publish": bool(answer)}])
 
     def move(self, d: int) -> None:
         sel = self.listbox.curselection()

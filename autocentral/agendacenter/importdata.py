@@ -14,6 +14,8 @@ which become extra meetings here.
 
 from __future__ import annotations
 
+import re
+
 import json
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -172,6 +174,23 @@ def files_search(opts: ImportOptions) -> tuple[Optional[Path], bool]:
     scanned = scan_files_folder(opts.workbook) if opts.workbook else None
     files_dir = opts.files_dir or scanned or (opts.workbook.parent if opts.workbook else None)
     return files_dir, scanned is not None
+
+
+def search_dirs_for(opts: ImportOptions, files_dir: Optional[Path]) -> list[Path]:
+    """Where to look for files: the files folder, and, when none was picked,
+    also the migration tool's own folders next to the workbook
+    (<site>-agenda-center-import, <site>-agenda-center-attach-after-import),
+    where its download script leaves the files."""
+    dirs = [p for p in [files_dir] if p]
+    if not opts.files_dir and opts.workbook:
+        wb = Path(opts.workbook)
+        site = re.split(r"-master_content_import", wb.stem, flags=re.I)[0]
+        if site and site != wb.stem:
+            for suffix in ("-agenda-center-import", "-agenda-center-attach-after-import"):
+                d = wb.parent / (site + suffix)
+                if d.is_dir() and d not in dirs:
+                    dirs.append(d)
+    return dirs
 
 
 def load_meetings(opts: ImportOptions) -> tuple[list[Meeting], list[str]]:
@@ -341,7 +360,7 @@ def load_meetings(opts: ImportOptions) -> tuple[list[Meeting], list[str]]:
                         target.json_tasks.append(f"files in: {_s(jm.get('localFolder'))}")
 
     # ------------------------------------------------- names and file checks
-    search_dirs = [p for p in [files_dir] if p]
+    search_dirs = search_dirs_for(opts, files_dir)
     if opts.json_path:
         jdir = Path(opts.json_path).parent
         for m in meetings:

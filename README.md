@@ -138,6 +138,14 @@ run and then for real. **Save list… / Load list…** keep lists as JSON
 files. **Undo a live run…** turns a run's `undo.json` into steps that
 reverse it. The list stays between sessions.
 
+**Add categories from file…** adds a step that creates the categories
+listed in a .csv or .xlsx: the column headed Name (or Category / Category
+Name / Title), else the first column. The migration tool's
+`<site>-agenda-center-categories.csv` works as it is. Run it **before** the
+Content Import: the importer refuses rows whose category isn't on the site.
+It asks whether to publish the new categories; ones already on the site are
+skipped.
+
 **Add from post-import tasks file…** reads the D10-to-Central Migration
 Tool's `<site>-agenda-center-post-import-tasks.json` (step 6 of that tool,
 "Finish what the importer can't do"). Pick that file, and the folder you
