@@ -20,13 +20,10 @@ from typing import Optional
 
 from ..models import InventoryRow
 from ..reporting import Reporter
-from .compare import MISSING, MISSING_MINUTES, NO_CATEGORY, CompareRow
-from .importdata import ImportOptions
-from .models import Agenda, Category, Meeting
+from .models import Agenda, Category
 from .plan import Runner
 from .site import AgendaCenterSite
 
-MISSING_FILES = "missing file(s): "      # importdata's problem text for files not found locally
 
 
 @dataclass
@@ -120,28 +117,20 @@ class AgendaJobs:
             else:
                 self.runner._bulk(action, action, agendas, undo_kind="unpublish" if publish else "republish")
         if sel.categories:
-            self.runner.category_action(action, self._categories(sel.categories), action)
-
-    def upload_missing(self, rows: list[CompareRow], meetings: list[Meeting], opts: ImportOptions,
-                       publish: bool, create_categories: bool, download_missing: bool,
-                       add_minutes: bool = True) -> None:
-        """Upload the comparison's missing agendas, and add minutes to agendas
-        that are there without them."""
-        params = {"publish": publish, "on_missing_category": "create" if create_categories else "skip",
-                  "on_duplicate": "skip", "download_missing": download_missing}
-        if download_missing:      # a file that can be fetched from the old site isn't a problem
-            for m in meetings:
-                m.problems = [p for p in m.problems if not (
-                    p.startswith(MISSING_FILES) and
-                    all(f in m.file_urls for f in p[len(MISSING_FILES):].split(", ")))]
-        resolve = self.runner.resolver(opts, meetings, params)
-        new =[r.meeting for r in rows if r.outcome in (MISSING, NO_CATEGORY) and r.meeting is not None]
-        if new:
-            self.r.info(f"Uploading {len(new)} missing agenda(s).")
-            self.runner.upload_meetings("upload", new, resolve, params)
-        if add_minutes:
-            targets = [(r.site.category_id, r.site.id, r.meeting) for r in rows
-                       if r.outcome == MISSING_MINUTES and r.site is not None and r.meeting is not None]
-            if targets:
-                self.r.info(f"Adding minutes to {len(targets)} agenda(s) already on the site.")
-                self.runner.add_minutes_to_existing("minutes", targets, resolve, publish=publish)
+            cats = self._categories(sel.categories)
+            self.runner.category_action(action, cats, action)
+            if publish:
+                # A ticked category means the whole category: its draft agendas too.
+                drafts = []
+                for cat in cats:
+                    self.site.ensure_view_options(cat)
+                    found = [a for a in self.site.agendas(cat) if not a.published]
+                    self.r.info(f"{cat.name}: {len(found)} draft agenda(s) to publish.")
+                    drafts += found
+                if drafts:
+                    if not self.live:
+                        for a in drafts:
+                            self.runner._agenda_res(action, action, a, "dry-run",
+                                                    "would publish (Notify Me: Don't Send)")
+                    else:
+                        self.runner._bulk(action, action, drafts, undo_kind="unpublish")

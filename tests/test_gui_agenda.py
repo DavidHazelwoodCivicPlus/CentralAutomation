@@ -1,4 +1,4 @@
-"""Agenda Center actions in the window: compare, then dry run -> live (no browser)."""
+"""Agenda Center actions in the window: dry run -> live (no browser)."""
 
 import tempfile
 import time
@@ -67,27 +67,6 @@ class AgendaWindow(unittest.TestCase):
             if not self.app.busy:
                 break
         self.root.update()
-
-    def test_compare_window(self):
-        from autocentral.gui_agenda import CompareWindow
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = "AgendaCenter"
-        ws.append(["Category", "Category Description", "Agenda Description", "Meeting Date",
-                   "Minutes Available", "Agenda File Name", "Minutes File Name"])
-        ws.append(["Council", None, "Regular Meeting", date(2024, 1, 2), True, "a.pdf", "m.pdf"])
-        ws.append(["Council", None, "Regular Meeting", date(2024, 2, 6), False, "b.pdf", None])
-        path = Path(self.tmp.name) / "import.xlsx"
-        wb.save(path)
-        with mock.patch("autocentral.gui_agenda.CompareWindow._save_settings"):
-            w = CompareWindow(self.app)
-            w.workbook.set(str(path))
-            w.reread.set(False)
-            w.run_compare()
-        c = w.cmp.counts()
-        self.assertEqual((c["missing"], c["missing minutes"], c["only on site"]), (1, 1, 1))
-        self.assertEqual(str(w.btn_upload["state"]), "normal")
-        self.assertIn("Missing (1)", w.nb.tab(0, "text"))
 
     def test_dry_run_then_live(self):
         from autocentral import gui_agenda

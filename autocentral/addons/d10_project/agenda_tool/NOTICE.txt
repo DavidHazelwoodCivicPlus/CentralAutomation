@@ -1,0 +1,5 @@
+A copy of Desktop\Tools\D10AgendaCenterMigration\autocentral (2026-11-20), used by the
+D10 project add-on to import and finish Agenda Center meetings exactly as that tool
+does. Its windows (gui, migrate_app, cli) were left out. Don't edit it here: copy a
+newer version over it instead. The newest D10-to-Central Migration Tool .html in this
+folder is the one used.

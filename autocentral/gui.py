@@ -1,8 +1,8 @@
 """The window (Tkinter): an Overview tab plus one tab per module.
 
 Each module tab shows that module's categories and items as a tree, with its
-own filters, its own columns and a tick box on every row. The ticks don't do
-anything yet: they are what later actions (delete, publish ...) will act on.
+own filters, its own columns and a tick box on every row. Its actions bar
+(gui_agenda.py, gui_actions.py) publishes, unpublishes and deletes the ticked rows.
 
 One background thread owns the browser; the window talks to it through
 queues, so the window never freezes while a module is read. The last read of
@@ -28,7 +28,7 @@ from .browser import Browser
 from .cli import ROOT, cache_dir, default_out
 from .inventory import RowFilter, export_xlsx
 from .models import InventoryRow, ModuleScan
-from .modules import MODULES, ModuleDef
+from .modules import FIXED_LABELS, MODULES, SLOW_KEYS, VIEW_ONLY_KEYS, ModuleDef
 from .reporting import CancelToken, Cancelled, Reporter, new_run_dir
 from .scanner import Scanner
 from .store import load_all, save_scan
@@ -42,6 +42,14 @@ DATE_HINT = "YYYY-MM-DD or YYYY-MM-DD HH:MM"
 BASE_COLS = [("status", "Status", 90), ("created_on", "Created", 135), ("created_by", "Created By", 130),
              ("modified_on", "Last Modified", 120), ("modified_by", "Modified By", 120)]
 TAIL_COLS = [("notes", "Notes", 220), ("id", "ID", 60)]
+# Wider columns for module fields that hold addresses or lists (the rest get 120).
+FIELD_WIDTHS = {"URL": 280, "Parent": 220, "Widgets": 240, "Kind": 150, "Links to": 220, "Shown as": 200,
+                "File name": 200, "Pages": 300, "In Document Center": 220, "Works": 160, "Folder": 220}
+# Fields shown in the preview panel, not as columns (still searched and exported).
+HIDDEN_FIELDS = {"Text", "HTML"}
+# Row colours by status (pages and their links; the rest keep the default).
+STATUS_COLOURS = {"draft": "#a15c00", "unpublished": "#a15c00", "not found": "#b00020", "broken": "#b00020",
+                  "external": "#1f5fa8", "linked page": "#6a3d9a"}
 
 
 def load_settings() -> dict:
@@ -56,6 +64,21 @@ def save_settings(data: dict) -> None:
         SETTINGS.write_text(json.dumps(data, indent=2), encoding="utf-8")
     except OSError:
         pass
+
+
+def _mmss(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def file_type(r: InventoryRow) -> str:
+    """A file's or image's type (pdf, png ...), for the File types tick boxes."""
+    t = (r.fields.get("Type") or "").strip().lower().lstrip(".")
+    if not t and r.status in ("file", "image file", "image"):
+        name = r.fields.get("File name") or r.fields.get("URL") or ""
+        m = re.search(r"\.([A-Za-z0-9]{2,5})$", name.split("?")[0])
+        t = m.group(1).lower() if m else "(no extension)"
+    return t
 
 
 def host_of(site: str) -> str:
@@ -117,7 +140,8 @@ class Worker(threading.Thread):
                 self.events.put(("idle",))
 
     def reporter(self) -> Reporter:
-        return Reporter(on_log=lambda level, msg: self.events.put(("log", level, msg)))
+        return Reporter(on_log=lambda level, msg: self.events.put(("log", level, msg)),
+                        on_progress=lambda done, total, label: self.events.put(("progress", done, total, label)))
 
 
 # ====================================================================== tabs
@@ -186,8 +210,25 @@ class ModuleTab:
         for v in (self.f_from, self.f_to, self.f_text):
             v.trace_add("write", lambda *_: self.refresh())
 
-        mid = ttk.Frame(f)
-        mid.pack(fill="both", expand=True, **pad)
+        self.show_box = ttk.LabelFrame(f, text="Show")
+        self.show_box.pack(fill="x", **pad)
+        self.show_vars: dict[str, tk.BooleanVar] = {}
+        self.type_box = ttk.LabelFrame(f, text="File types")
+        self.type_vars: dict[str, tk.BooleanVar] = {}
+        self._pad = pad
+
+        self.preview = None
+        if self.m.key == "pages":
+            # the table on top, the text / HTML preview of the selected row underneath (drag to resize)
+            panes = ttk.Panedwindow(f, orient="vertical")
+            panes.pack(fill="both", expand=True, **pad)
+            mid = ttk.Frame(panes)
+            panes.add(mid, weight=3)
+            self.preview = BlockPreview(self, panes)
+            panes.add(self.preview.frame, weight=2)
+        else:
+            mid = ttk.Frame(f)
+            mid.pack(fill="both", expand=True, **pad)
         self.tree = ttk.Treeview(mid, show="tree headings", selectmode="extended")
         ys = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
         xs = ttk.Scrollbar(mid, orient="horizontal", command=self.tree.xview)
@@ -198,9 +239,19 @@ class ModuleTab:
         mid.rowconfigure(0, weight=1)
         mid.columnconfigure(0, weight=1)
         self.tree.tag_configure("category", background="#eef2f7")
+        for st, colour in STATUS_COLOURS.items():
+            self.tree.tag_configure("st_" + st.replace(" ", "_"), foreground=colour)
         self.tree.tag_configure("context", foreground="#999999")
         self.tree.bind("<Button-1>", self._on_click)
         self.tree.bind("<space>", self._on_space)
+        self.tree.bind("<Double-1>", self._on_double)
+        if self.preview is not None:
+            self.tree.bind("<<TreeviewSelect>>", lambda _e: self.preview.show_selected(), add="+")
+            # ← and → in the table step through the pages shown (instead of folding the tree).
+            self.tree.bind("<Left>", lambda _e: self.preview.step(-1) or "break")
+            self.tree.bind("<Right>", lambda _e: self.preview.step(1) or "break")
+        self.tree.bind("<ButtonRelease-1>", lambda _e: setattr(self, "_name_width", self.tree.column("#0", "width")),
+                       add="+")
         self._set_columns([])
 
         bar = ttk.Frame(f)
@@ -217,29 +268,37 @@ class ModuleTab:
     def _set_columns(self, fields: list[str]) -> None:
         self.field_cols = fields
         cols = [k for k, _, _ in BASE_COLS] + [f"f{i}" for i in range(len(fields))] + [k for k, _, _ in TAIL_COLS]
+        self.tree.configure(displaycolumns="#all")      # the old list may name columns that are going
         self.tree.configure(columns=cols)
         self.tree.heading("#0", text="Name", command=lambda: self.sort_by("name"))
-        self.tree.column("#0", width=380, stretch=True)
-        specs = BASE_COLS + [(f"f{i}", label, 120) for i, label in enumerate(fields)] + TAIL_COLS
+        self.tree.column("#0", width=getattr(self, "_name_width", 380), stretch=False)
+        specs = BASE_COLS + [(f"f{i}", label, FIELD_WIDTHS.get(label, 120)) for i, label in enumerate(fields)] + TAIL_COLS
         for k, label, width in specs:
             self.tree.heading(k, text=label, command=lambda k=k: self.sort_by(k))
             self.tree.column(k, width=width, stretch=False)
 
     # ------------------------------------------------------------------ data
-    def set_scan(self, ms: Optional[ModuleScan]) -> None:
+    def set_scan(self, ms: Optional[ModuleScan], keep_ticks: bool = False) -> None:
+        same = keep_ticks and ms is self.scan
         self.scan = ms
-        self.checked.clear()
+        if not same:
+            self.checked.clear()
         self.reading = False
         rows = ms.rows if ms else []
         fields: list[str] = []
         for r in rows:                  # the module's own columns, skipping ones empty everywhere
             for k, v in r.fields.items():
-                if v and k not in fields:
+                if v and k not in fields and k not in HIDDEN_FIELDS:
                     fields.append(k)
         self._set_columns(fields)
+        # Hide the standard columns no row fills (Created ... when History Log wasn't read).
+        shown = [k for k, _, _ in BASE_COLS if k == "status" or any(getattr(r, k, "") for r in rows)]
+        notes = ["notes"] if any(self._notes(r) for r in rows) else []
+        self.tree.configure(displaycolumns=shown + [f"f{i}" for i in range(len(fields))] + notes + ["id"])
         self.parent = self._parents(rows)
         statuses = sorted({r.status for r in rows if r.status})
         people = sorted({r.created_by for r in rows if r.created_by})
+        self._fill_show_box(rows)
         self.cb_status.configure(values=[ANY] + statuses)
         self.cb_by.configure(values=[ANY, NO_INFO] + people)
         if self.f_status.get() not in [ANY] + statuses:
@@ -248,6 +307,72 @@ class ModuleTab:
             self.f_by.set(ANY)
         self._update_info()
         self.refresh()
+
+    def _fill_show_box(self, rows: list[InventoryRow]) -> None:
+        """One tick box per status (for Pages: per page status and per kind of
+        link, widget and image), with how many rows have it. Unticking hides them."""
+        counts: dict[str, int] = {}
+        for r in rows:
+            if r.status:
+                counts[r.status] = counts.get(r.status, 0) + 1
+        old = {k: v.get() for k, v in self.show_vars.items()}
+        for w in self.show_box.winfo_children():
+            w.destroy()
+        self.show_vars = {}
+        if not counts:
+            ttk.Label(self.show_box, text="(read the module first)", foreground="#777").pack(side="left", padx=4)
+            return
+        for st in sorted(counts):
+            v = tk.BooleanVar(value=old.get(st, True))
+            self.show_vars[st] = v
+            ttk.Checkbutton(self.show_box, text=f"{st} ({counts[st]})", variable=v,
+                            command=self.refresh).pack(side="left", padx=(4, 6))
+        ttk.Button(self.show_box, text="All", width=4, command=lambda: self._show_all(True)).pack(side="right", padx=2)
+        ttk.Button(self.show_box, text="None", width=5, command=lambda: self._show_all(False)).pack(side="right", padx=2)
+        # File types (pdf, png ...) of files and images, when there are any.
+        types: dict[str, int] = {}
+        for r in rows:
+            t = file_type(r)
+            if t:
+                types[t] = types.get(t, 0) + 1
+        old_t = {k: v.get() for k, v in self.type_vars.items()}
+        for w in self.type_box.winfo_children():
+            w.destroy()
+        self.type_vars = {}
+        if not types:
+            self.type_box.pack_forget()
+            return
+        self.type_box.pack(fill="x", after=self.show_box, **self._pad)
+        for t in sorted(types, key=lambda x: (-types[x], x))[:30]:
+            v = tk.BooleanVar(value=old_t.get(t, True))
+            self.type_vars[t] = v
+            ttk.Checkbutton(self.type_box, text=f"{t} ({types[t]})", variable=v, command=self.refresh).pack(
+                side="left", padx=(4, 6))
+        ttk.Button(self.type_box, text="All", width=4, command=lambda: self._types_all(True)).pack(side="right", padx=2)
+        ttk.Button(self.type_box, text="None", width=5, command=lambda: self._types_all(False)).pack(side="right", padx=2)
+
+    def _types_all(self, on: bool) -> None:
+        for v in self.type_vars.values():
+            v.set(on)
+        self.refresh()
+
+    def _show_all(self, on: bool) -> None:
+        for v in self.show_vars.values():
+            v.set(on)
+        self.refresh()
+
+    def _on_double(self, e) -> Optional[str]:
+        """Double-click a row with an address: open it in the logged-in Chrome
+        (a page opens with Live Edit on)."""
+        iid = self.tree.identify_row(e.y)
+        if not iid or not self.scan:
+            return None
+        r = self.scan.rows[int(iid)]
+        url = r.fields.get("URL", "")
+        if not url:
+            return None
+        self.app.open_in_chrome(url, live_edit=(r.level == "category" and self.m.key == "pages"))
+        return "break"
 
     def set_reading(self) -> None:
         self.reading = True
@@ -343,7 +468,18 @@ class ModuleTab:
         rows = self.scan.rows if self.scan else []
         flt = self.current_filter()
         ticked_only = self.f_ticked.get()
-        self.matched = {i for i, r in enumerate(rows) if flt.match(r) and (not ticked_only or i in self.checked)}
+        hidden = {st for st, v in self.show_vars.items() if not v.get()}
+        hidden_types = {t for t, v in self.type_vars.items() if not v.get()}
+        gone: set[int] = set()
+        if hidden or hidden_types:
+            for i, r in enumerate(rows):
+                p = self.parent.get(i)
+                if r.status in hidden or (r.level == "item" and p is not None and rows[p].status in hidden):
+                    gone.add(i)
+                elif hidden_types and file_type(r) in hidden_types:
+                    gone.add(i)
+        self.matched = {i for i, r in enumerate(rows)
+                        if i not in gone and flt.match(r) and (not ticked_only or i in self.checked)}
         visible = set(self.matched)
         for i in self.matched:         # keep the categories above a match, greyed
             p, hops = self.parent.get(i), 0
@@ -364,6 +500,8 @@ class ModuleTab:
         def add(parent_iid: str, i: int) -> None:
             r = rows[i]
             tags = [r.level] + ([] if i in self.matched else ["context"])
+            if r.status in STATUS_COLOURS and i in self.matched:
+                tags.append("st_" + r.status.replace(" ", "_"))
             values = [self._value(r, k) for k, _, _ in BASE_COLS] + \
                      [r.fields.get(f, "") for f in self.field_cols] + \
                      [self._notes(r), r.own_id]
@@ -491,6 +629,7 @@ class OverviewTab:
         ttk.Label(bar, textvariable=self.total).pack(side="left")
         ttk.Button(bar, text="Open inventories folder", command=app.open_folder).pack(side="right")
         ttk.Button(bar, text="Export everything…", command=app.export_all).pack(side="right", padx=4)
+        ttk.Button(bar, text="Wipe the whole site…", command=app.wipe_site).pack(side="right", padx=12)
 
     def refresh(self) -> None:
         sel = self.tree.selection()
@@ -538,6 +677,159 @@ class OverviewTab:
             self.app.nb.select(self.app.tabs[sel[0]].frame)
 
 
+class BlockPreview:
+    """Under the Pages table: the selected text block's readable text and its
+    HTML (for a page: all its text blocks), with Copy HTML and a preview in
+    your browser styled like the site."""
+
+    def __init__(self, tab: "ModuleTab", parent) -> None:
+        self.tab = tab
+        self.frame = ttk.Frame(parent)
+        bar = ttk.Frame(self.frame)
+        bar.pack(fill="x")
+        self.what = tk.StringVar(value="Select a page or a text block to see its content.")
+        ttk.Label(bar, textvariable=self.what).pack(side="left")
+        ttk.Button(bar, text="Next page ▶", command=lambda: self.step(1)).pack(side="right")
+        ttk.Button(bar, text="◀ Previous page", command=lambda: self.step(-1)).pack(side="right", padx=4)
+        ttk.Button(bar, text="Preview shown pages in browser", command=self.preview_all).pack(side="right", padx=8)
+        ttk.Button(bar, text="Preview in browser", command=self.preview_in_browser).pack(side="right")
+        ttk.Button(bar, text="Copy HTML", command=self.copy_html).pack(side="right", padx=4)
+
+        nb = ttk.Notebook(self.frame)
+        nb.pack(fill="both", expand=True)
+        self.text = self._box(nb, "Text")
+        self.html = self._box(nb, "HTML")
+        self.rows: list[InventoryRow] = []
+        self.page: Optional[InventoryRow] = None
+
+    @staticmethod
+    def _box(nb, label: str) -> tk.Text:
+        f = ttk.Frame(nb)
+        nb.add(f, text=label)
+        ys = ttk.Scrollbar(f, orient="vertical")
+        t = tk.Text(f, wrap="word", height=8, state="disabled", yscrollcommand=ys.set,
+                    font=("Consolas", 9) if label == "HTML" else ("Segoe UI", 9))
+        ys.configure(command=t.yview)
+        ys.pack(side="right", fill="y")
+        t.pack(side="left", fill="both", expand=True)
+        return t
+
+    @staticmethod
+    def _set(box: tk.Text, value: str) -> None:
+        box.configure(state="normal")
+        box.delete("1.0", "end")
+        box.insert("1.0", value)
+        box.configure(state="disabled")
+
+    def show_selected(self) -> None:
+        sel = self.tab.tree.selection()
+        if not sel or not self.tab.scan:
+            return
+        rows = self.tab.scan.rows
+        i = int(sel[0])
+        r = rows[i]
+        if r.level == "category":
+            self.page = r
+            self.rows = [x for x in rows if x.level == "item" and x.status == "text block" and x.category_id == r.category_id]
+        elif r.status == "text block":
+            self.page = next((x for x in rows if x.level == "category" and x.category_id == r.category_id), None)
+            self.rows = [r]
+        else:
+            self.page, self.rows = None, []
+            self.what.set(f"{r.status}: {r.fields.get('URL', '')}")
+            self._set(self.text, "\n".join(f"{k}: {v}" for k, v in r.fields.items() if v))
+            self._set(self.html, r.detail)
+            return
+        name = self.page.name if self.page else ""
+        shared = self.rows[0].fields.get("Shared", "") if len(self.rows) == 1 else ""
+        self.what.set(f"{name}: {len(self.rows)} text block(s)" + (f" (shared: {shared})" if shared else "")
+                      if self.rows else f"{name}: no text blocks (read Pages again if this read is from before text blocks were kept)")
+        sep = "\n\n" + "-" * 40 + "\n\n"
+        self._set(self.text, sep.join(x.fields.get("Text", "") for x in self.rows))
+        self._set(self.html, sep.join(x.fields.get("HTML", "") for x in self.rows))
+
+    def step(self, d: int) -> None:
+        """Select the previous / next page shown in the table and show it."""
+        tab = self.tab
+        if not tab.scan:
+            return
+        rows = tab.scan.rows
+        pages = [i for i in tab.shown if rows[i].level == "category"]
+        if not pages:
+            return
+        sel = tab.tree.selection()
+        cur = int(sel[0]) if sel else None
+        if cur is not None and rows[cur].level != "category":       # on a row under a page: start from that page
+            cur = next((i for i in pages if rows[i].category_id == rows[cur].category_id), None)
+        if cur in pages:
+            k = pages.index(cur) + d
+        else:
+            k = 0 if d > 0 else len(pages) - 1
+        k = max(0, min(len(pages) - 1, k))
+        iid = str(pages[k])
+        tab.tree.selection_set(iid)
+        tab.tree.focus(iid)
+        tab.tree.see(iid)
+        self.show_selected()
+
+    def preview_all(self) -> None:
+        """Every page shown in the table, in one preview page in your browser:
+        ← and → (or the buttons) step through them."""
+        import webbrowser
+        from .sitecontent import preview_pages_html
+        tab = self.tab
+        if not tab.scan:
+            return
+        rows = tab.scan.rows
+        home = next((x for x in rows if x.level == "category" and x.category_id == 1), None)
+        sheets = (home.extra.get("stylesheets") if home else None) or []
+        pages = []
+        for i in tab.shown:
+            r = rows[i]
+            if r.level != "category":
+                continue
+            blocks = [x.fields.get("HTML", "") for x in rows if x.level == "item" and x.status == "text block"
+                      and x.category_id == r.category_id]
+            pages.append({"title": r.name, "status": r.status, "path": r.fields.get("Parent", ""),
+                          "url": r.fields.get("URL", ""), "blocks": blocks})
+        if not pages:
+            messagebox.showinfo("Preview", "No pages are shown in the table.")
+            return
+        out = ROOT / "cache" / "previews" / "shown_pages.html"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(preview_pages_html(self.tab.app.site.get(), pages, sheets), encoding="utf-8")
+        webbrowser.open(out.as_uri())
+        self.tab.app.log(f"Preview of {len(pages)} page(s) opened in your browser: ← and → step through them.")
+
+    def copy_html(self) -> None:
+        if not self.rows:
+            return
+        root = self.tab.frame.winfo_toplevel()
+        root.clipboard_clear()
+        root.clipboard_append("\n\n".join(x.fields.get("HTML", "") for x in self.rows))
+        self.tab.app.log(f"Copied the HTML of {len(self.rows)} text block(s).")
+
+    def preview_in_browser(self) -> None:
+        """A page made from the text block(s) with the site's own stylesheets,
+        opened in your browser."""
+        import webbrowser
+        from .sitecontent import preview_html
+        if not self.rows:
+            messagebox.showinfo("Preview", "Select a page or a text block first.")
+            return
+        scan = self.tab.scan
+        home = next((x for x in scan.rows if x.level == "category" and x.category_id == 1), None) if scan else None
+        sheets = (home.extra.get("stylesheets") if home else None) or []
+        title = self.page.name if self.page else "Text block"
+        out = ROOT / "cache" / "previews" / f"page_{self.page.category_id if self.page else 'block'}.html"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(preview_html(self.tab.app.site.get(), title, [x.fields.get("HTML", "") for x in self.rows], sheets),
+                       encoding="utf-8")
+        webbrowser.open(out.as_uri())
+        self.tab.app.log(f"Preview of {title} opened in your browser." +
+                         ("" if sheets else " (Read Pages again to get the site's styles into previews.)"))
+
+
 # ====================================================================== app
 class App:
     def __init__(self, root: tk.Tk) -> None:
@@ -573,15 +865,21 @@ class App:
         self.btn_login.pack(side="left")
         self.status = tk.StringVar(value="Not connected.")
         ttk.Label(top, textvariable=self.status, foreground="#555").pack(side="left", padx=10)
+        self.working = tk.StringVar(value="")
+        ttk.Label(top, textvariable=self.working, foreground="#1f5fa8", width=46).pack(side="left", padx=6)
+        self._busy_since = 0.0
+        self._busy_what = ""
+        self._eta_end: Optional[float] = None
+        self._progress_start: dict[str, tuple[float, int]] = {}
 
         self.btn_stop = ttk.Button(top, text="Stop", command=self.stop, state="disabled")
         self.btn_stop.pack(side="right")
-        self.btn_all = ttk.Button(top, text="Read all modules", command=lambda: self.read([m.key for m in MODULES]))
+        self.btn_all = ttk.Button(top, text="Read all modules", command=lambda: self.read([m.key for m in MODULES if m.key not in SLOW_KEYS]))
         self.btn_all.pack(side="right", padx=4)
         self.refresh_history = tk.BooleanVar(value=False)
         ttk.Checkbutton(top, text="Re-read the whole History Log", variable=self.refresh_history).pack(
             side="right", padx=6)
-        self.with_history = tk.BooleanVar(value=True)
+        self.with_history = tk.BooleanVar(value=False)   # slow on busy modules: off unless ticked
         ttk.Checkbutton(top, text="Created info (History Log)", variable=self.with_history).pack(side="right")
 
         # The log is packed first, at the bottom, at a fixed height; the tabs
@@ -605,8 +903,32 @@ class App:
             t = ModuleTab(self, self.nb, m)
             self.tabs[m.key] = t
             self.nb.add(t.frame, text=m.label)
+        from .addons import add_tabs
+        self.addons = add_tabs(self, self.nb)          # switchable project tabs (settings.json "addons")
+        from .gui_plan import PlanTab, FindReplaceDialog, move_pages_dialog, move_staff_dialog
+        self.plan = PlanTab(self, self.nb)
+        self.nb.add(self.plan.frame, text="Plan")
+        self.plan.refresh()
+        from .gui_actions import ModuleActions
         from .gui_agenda import AgendaActions
         self.agenda_actions = AgendaActions(self, self.tabs["agenda"])
+        self.module_actions = {k: ModuleActions(self, t) for k, t in self.tabs.items()
+                               if k != "agenda" and k not in VIEW_ONLY_KEYS}
+        self.last_first = tk.BooleanVar(value=self.settings.get("staff_last_first", True))
+        ttk.Checkbutton(self.tabs["staff"].head, text="Last name, First name", variable=self.last_first,
+                        command=self._staff_name_order).pack(side="right", padx=8)
+        ttk.Button(self.tabs["staff"].head, text="Move ticked… (to the plan)",
+                   command=lambda: move_staff_dialog(self)).pack(side="right", padx=4)
+        pages = self.tabs["pages"]
+        ttk.Button(pages.head, text="Find and replace…", command=lambda: FindReplaceDialog(self)).pack(side="right", padx=4)
+        ttk.Button(pages.head, text="Move ticked pages… (to the plan)",
+                   command=lambda: move_pages_dialog(self)).pack(side="right", padx=4)
+        self.btn_links = ttk.Button(pages.head, text="Check links…", command=self.check_links)
+        self.btn_links.pack(side="right", padx=4)
+        ttk.Button(pages.head, text="Export site map…", command=self.export_sitemap).pack(side="right", padx=4)
+        for key in ("pages", "docs"):
+            ttk.Label(self.tabs[key].head, text="Double-click a row to open it in your browser.",
+                      foreground="#777").pack(side="left", padx=12)
 
     # ============================================================ site data
     def host(self) -> str:
@@ -628,6 +950,19 @@ class App:
 
     def set_module(self, ms: Optional[ModuleScan], key: str) -> None:
         tab = self.tabs[key]
+        if key in ("pages", "docs"):
+            # Files and images on pages <-> Document Center / Public Images.
+            from .sitecontent import cross_reference
+            other = self.tabs["docs" if key == "pages" else "pages"]
+            pages_ms, docs_ms = (ms, other.scan) if key == "pages" else (other.scan, ms)
+            cross_reference(pages_ms, docs_ms)
+            if other.scan is not None:
+                other.set_scan(other.scan, keep_ticks=True)
+        if ms is not None and key in FIXED_LABELS:
+            ms.label = tab.m.label
+        if key == "staff" and hasattr(self, "last_first"):
+            from .sitecontent import set_staff_name_order
+            set_staff_name_order(ms, self.last_first.get())
         tab.set_scan(ms)
         label = ms.label if ms and ms.present and ms.label else tab.m.label
         if ms is not None and not ms.present:
@@ -644,11 +979,21 @@ class App:
                     self.log(ev[2], ev[1])
                 elif kind == "status":
                     self.status.set(ev[1])
+                elif kind == "progress":
+                    self._progress(ev[1], ev[2], ev[3])
                 elif kind == "loggedin":
                     self.site.set(ev[1])
                     self.load_saved(force=True)
                 elif kind == "module":
                     self._module_done(ev[1], ev[2])
+                elif kind == "updated":            # rows changed in place (link check): save and show
+                    ms = self.tabs[ev[1]].scan
+                    if ms is not None:
+                        try:
+                            save_scan(cache_dir(self.host()), ms)
+                        except OSError as e:
+                            self.log(f"Couldn't save {ms.label}: {e}", "warn")
+                        self.tabs[ev[1]].set_scan(ms, keep_ticks=True)
                 elif kind == "done":
                     self.log(ev[1])
                 elif kind == "result":
@@ -666,7 +1011,9 @@ class App:
                         except tk.TclError:
                             pass
                     if ev[2]:                      # a live run changed the site: read it again
-                        self._then = lambda: self.read(["agenda"])
+                        key = getattr(win, "module", "agenda") if win is not None else "agenda"
+                        if key:
+                            self._then = lambda key=key: self.read([key])
                 elif kind == "idle":
                     self._set_busy(False)
                     for t in self.tabs.values():
@@ -697,18 +1044,58 @@ class App:
         self.logbox.see("end")
         self.logbox.configure(state="disabled")
 
-    def _set_busy(self, busy: bool) -> None:
+    def _set_busy(self, busy: bool, what: str = "") -> None:
+        if busy and not self.busy:
+            self._busy_since = time.monotonic()
+            self._busy_what = what or self._busy_what or "Working"
+            self._progress_start = {}
+            self.root.after(500, self._tick)
+        if not busy:
+            self.working.set("")
+            self._busy_what, self._eta_end = "", None
         self.busy = busy
         state = "disabled" if busy else "normal"
-        for b in [self.btn_all, self.btn_login] + [t.btn_read for t in self.tabs.values()] + \
-                self.agenda_actions.buttons:
+        for b in [self.btn_all, self.btn_login, self.btn_links] + [t.btn_read for t in self.tabs.values()] + \
+                self.agenda_actions.buttons + [b for a in self.module_actions.values() for b in a.buttons] + \
+                self.plan.buttons:
             b.configure(state=state)
         self.btn_stop.configure(state="normal" if busy else "disabled")
 
-    def _submit(self, job: Callable[[], None]) -> None:
+    def _tick(self, n: int = 1) -> None:
+        """While busy: '.', '..', '...' twice a second, with time left (or,
+        when there's no way to guess yet, time so far)."""
+        if not self.busy:
+            self.working.set("")
+            return
+        dots = "." * (n % 3 + 1)
+        now = time.monotonic()
+        if self._eta_end is not None:
+            left = self._eta_end - now
+            when = f"about {_mmss(left)} left" if left > 1 else "almost done"
+        else:
+            when = f"{_mmss(now - self._busy_since)} so far"
+        self.working.set(f"{self._busy_what}{dots:<3}  {when}")
+        self.root.after(500, lambda: self._tick(n + 1))
+
+    def _progress(self, done: int, total: int, label: str) -> None:
+        """A part of the job with a count (pages read, folders listed ...):
+        time left from how fast it has gone so far."""
+        now = time.monotonic()
+        if label not in self._progress_start or done < self._progress_start[label][1]:
+            self._progress_start[label] = (now, done)
+            return
+        t0, d0 = self._progress_start[label]
+        if done > d0 and total > done:
+            rate = (now - t0) / (done - d0)
+            later = getattr(self, "_eta_after", 0.0)
+            self._eta_end = now + rate * (total - done) + later
+        elif done >= total:
+            self._progress_start.pop(label, None)
+
+    def _submit(self, job: Callable[[], None], what: str = "Working") -> None:
         if self.busy:
             return
-        self._set_busy(True)
+        self._set_busy(True, what)
         self.worker.jobs.put(job)
 
     # ============================================================== actions
@@ -747,8 +1134,8 @@ class App:
         save_settings(self.settings)
 
     def run_job(self, win, live: bool) -> Optional[Path]:
-        """Run an Agenda Center job (dry run or live) on the worker. Results go
-        to the run window and to runs/<site>/<time>_dryrun|live/results.csv."""
+        """Run a module's job (dry run or live) on the worker. Results go to
+        the run window and to runs/<site>/<time>_dryrun|live/results.csv."""
         from .gui_agenda import RUNS
         from .agendacenter.jobs import AgendaJobs
         b = self.worker.browser
@@ -766,7 +1153,8 @@ class App:
                            on_result=lambda r: ev.put(("result", wid, r)), run_dir=run_dir)
             ok = False
             try:
-                win.job(AgendaJobs(self.worker.browser, rep, live))
+                factory = getattr(win, "factory", None) or AgendaJobs
+                win.job(factory(self.worker.browser, rep, live))
                 ok = True
             finally:
                 ev.put(("job_done", wid, live, ok))
@@ -786,6 +1174,9 @@ class App:
             return
         for k in keys:
             self.tabs[k].set_reading()
+        # First guess at the time: how long the same modules took last time.
+        before = [self.tabs[k].scan.seconds for k in keys if self.tabs[k].scan and self.tabs[k].scan.seconds]
+        names = ", ".join(self.tabs[k].m.label for k in keys[:2]) + (" …" if len(keys) > 2 else "")
         self.overview.refresh()
         history = self.with_history.get()
         refresh = self.refresh_history.get()
@@ -800,12 +1191,35 @@ class App:
                          cache_dir=cache_dir(host), refresh_history=refresh)
             sc.scan(keys, with_history=history)
             ev.put(("done", f"Read {len(keys)} module(s) in {time.monotonic() - t0:.0f}s."))
-        self._submit(job)
+        self._submit(job, f"Reading {names}")
+        self._eta_end = time.monotonic() + sum(before) if len(before) == len(keys) else None
         self._then = then
+
+    def wipe_site(self) -> None:
+        """Every module's content, every page (not Home or the layout pages) and
+        every document and image: dry run first, then the address typed."""
+        if self.worker.browser is None:
+            messagebox.showinfo("Wipe the whole site", "Open Chrome and log in first.")
+            return
+        host = self.worker.browser.host
+        if not messagebox.askyesno(
+                "Wipe the whole site",
+                f"This deletes EVERYTHING on {host}:\n\n"
+                "  every agenda, bid, FAQ, news flash, archive item, calendar and event, form, facility,\n"
+                "  Resource Directory entry and staff department and person;\n"
+                "  every page except Home and the layout pages;\n"
+                "  every folder, document and image in Document Center and Public Images.\n\n"
+                "It can't be undone. A dry run comes first and shows everything it would delete; the live "
+                "run then needs the site's address typed.\n\nStart the dry run?", icon="warning"):
+            return
+        from .actions.wipe import SiteWipe
+        from .gui_agenda import RunWindow
+        RunWindow(self, "Wipe the whole site", f"Wipe EVERYTHING on {host}: modules, pages, documents and images "
+                  "(Home and the layout pages stay).", lambda jobs: jobs.run(), factory=SiteWipe, module=None)
 
     def stop(self) -> None:
         self.worker.cancel.cancel()
-        self.log("Stopping after the current page…", "warn")
+        self.log("Stopping: ending the pages and requests in progress…", "warn")
 
     def export_all(self) -> None:
         scans = [t.scan for t in self.tabs.values() if t.scan is not None]
@@ -825,6 +1239,73 @@ class App:
         folder = default_out(self.site.get()).parent
         folder.mkdir(parents=True, exist_ok=True)
         os.startfile(folder)
+
+    def _staff_name_order(self) -> None:
+        from .sitecontent import set_staff_name_order
+        self.settings["staff_last_first"] = self.last_first.get()
+        save_settings(self.settings)
+        tab = self.tabs["staff"]
+        set_staff_name_order(tab.scan, self.last_first.get())
+        tab.refresh()
+
+    def open_in_chrome(self, url: str, live_edit: bool = False) -> None:
+        """Open an address in the computer's own browser, not the tool's
+        Chrome: the tool's Chrome may be busy reading, and files open there as
+        odd downloads. Drafts show when you're logged in to the site there
+        with Live Edit on."""
+        import webbrowser
+        site = self.site.get().strip().rstrip("/")
+        full = url if re.match(r"^https?://", url) else site + ("" if url.startswith("/") else "/") + url
+        webbrowser.open(full)
+        self.log(f"Opened {full} in your browser.")
+
+    def check_links(self) -> None:
+        """Check every distinct link, file and image address on the read pages."""
+        tab = self.tabs["pages"]
+        b = self.worker.browser
+        if b is None:
+            messagebox.showinfo("AutoCentral", "Click 'Open Chrome and log in' first.")
+            return
+        if tab.scan is None or not tab.scan.rows:
+            messagebox.showinfo("AutoCentral", "Read Pages first.")
+            return
+        if self.busy:
+            return
+        ev = self.events
+        rows = tab.scan.rows
+
+        def job() -> None:
+            from .actions.engine import Relay
+            from .linkcheck import check_rows
+            w = self.worker
+            w.browser.r = w.reporter()
+            t0 = time.monotonic()
+            check_rows(rows, w.browser.host, Relay(w.browser), lambda m: ev.put(("log", "info", m)),
+                       cancel_check=w.cancel.check,
+                       progress=lambda d, t, label: ev.put(("progress", d, t, label)))
+            ev.put(("updated", "pages"))
+            ev.put(("done", f"Link check took {time.monotonic() - t0:.0f}s."))
+        self._submit(job, "Checking links")
+
+    def export_sitemap(self) -> None:
+        """The shown pages as a CivicPlus-style site map, one tier per column."""
+        from .sitecontent import export_sitemap, tree_depths
+        tab = self.tabs["pages"]
+        if not tab.scan or not tab.scan.rows:
+            messagebox.showinfo("AutoCentral", "Read Pages first.")
+            return
+        default = default_out(self.site.get())
+        default = default.with_name(default.stem + "_sitemap.xlsx")
+        default.parent.mkdir(parents=True, exist_ok=True)
+        path = filedialog.asksaveasfilename(initialdir=str(default.parent), initialfile=default.name,
+                                            defaultextension=".xlsx", filetypes=[("Excel", "*.xlsx")])
+        if not path:
+            return
+        rows = tab.scan.rows
+        depths = tree_depths(rows, tab.parent)
+        shown = [rows[i] for i in tab.shown if rows[i].level == "category"]
+        out = export_sitemap(Path(path), self.site.get(), shown, depths)
+        self.log(f"Saved the site map ({len(shown)} pages): {out}")
 
     def _close(self) -> None:
         if self.busy and not messagebox.askyesno("AutoCentral", "Something is still being read. Stop it and close?"):

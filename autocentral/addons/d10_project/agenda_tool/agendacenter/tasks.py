@@ -17,7 +17,16 @@ A meeting is found on the site by Category + Meeting Date + Agenda
 Description as imported, the same way the migration tool describes it.
 
 Loading the file turns it into to-do list steps (see todo_steps), which the
-runner carries out: dry run first, then for real.
+runner carries out: dry run first, then for real. It works from the JSON
+alone, in this order:
+
+  1. attach the minutes (the site only allows it on a published agenda, so
+     those drafts are published first)
+  2. open each agenda that needs it once: put in its video links and Save,
+     which also builds an item-based agenda's HTML page (bulk publish
+     doesn't)
+  3. publish the agendas it worked on that are still drafts
+     (Notify Me: Don't Send)
 """
 
 from __future__ import annotations
@@ -36,11 +45,11 @@ CREATE = "create-meeting-manually"
 MINUTES = "attach-minutes"
 MEDIA = "add-media-links"
 SAVE = "save-to-build-html"
-KINDS = [CREATE, MINUTES, MEDIA, SAVE]          # the order they run in
+KINDS = [CREATE, MINUTES, SAVE, MEDIA]          # the order they run in
 KIND_LABELS = {CREATE: "create the meetings the importer couldn't",
                MINUTES: "attach minutes",
-               MEDIA: "add video links",
-               SAVE: "open and save item-based agendas (builds their public page)"}
+               SAVE: "open and save item-based agendas (builds their HTML agenda page)",
+               MEDIA: "add the video links"}
 NO_AGENDA_TEMPLATE = "No-Agenda-Template.pdf"
 
 
@@ -195,20 +204,20 @@ def find_agenda(t: PostTask, agendas: list) -> tuple[Optional[object], str]:
 
 def todo_steps(tasks_file: Path, files_dir: Optional[Path], tasks: list[PostTask], *, publish: bool = True,
                download_missing: bool = False, create_categories: bool = True, publish_categories: bool = True,
-               kinds: Optional[list[str]] = None) -> list[dict]:
-    """The to-do list steps (plan step dicts) for one tasks file, in the
-    order they must run: categories, then new meetings, then minutes, video
-    links and saves on meetings that are already there."""
+               kinds: Optional[list[str]] = None, tabs: int = 1) -> list[dict]:
+    """The to-do list steps (plan step dicts) for one tasks file: the
+    categories, then one step that does every chosen task in order (new
+    meetings, minutes, open-and-save with video links, publish)."""
     kinds = kinds or KINDS
     c = counts(tasks)
-    common = {"tasks_file": str(tasks_file), "files_dir": str(files_dir) if files_dir else "",
-              "download_missing": download_missing, "publish": publish}
     steps: list[dict] = []
     if create_categories:
         steps.append({"action": "create_categories", "names": categories(tasks), "publish": publish_categories})
-    for k in KINDS:
-        if k in kinds and c[k]:
-            steps.append({"action": "post_import_tasks", "kinds": [k], **common})
+    todo = [k for k in KINDS if k in kinds and c[k]]
+    if todo:
+        steps.append({"action": "post_import_tasks", "kinds": todo, "tasks_file": str(tasks_file),
+                      "files_dir": str(files_dir) if files_dir else "", "download_missing": download_missing,
+                      "publish": publish, **({"tabs": tabs} if tabs > 1 else {})})
     return steps
 
 

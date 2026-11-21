@@ -93,8 +93,10 @@ def export_xlsx(path: Path, site: str, scans: list[ModuleScan], rows: Optional[l
     grey = PatternFill("solid", fgColor="EEEEEE")
     for r in rows:
         d = r.as_dict()
-        ws.append([d.get(k) if d.get(k) not in (None,) else "" for k, _ in COLUMNS] +
-                  [r.fields.get(k, "") for k in extra_cols])
+        cells = [d.get(k) if d.get(k) not in (None,) else "" for k, _ in COLUMNS] + \
+                [r.fields.get(k, "") for k in extra_cols]
+        ws.append([c[:32000] + " …(cut: Excel's cell limit)" if isinstance(c, str) and len(c) > 32000 else c
+                   for c in cells])
         if r.level == "category":
             for c in ws[ws.max_row]:
                 c.fill = grey

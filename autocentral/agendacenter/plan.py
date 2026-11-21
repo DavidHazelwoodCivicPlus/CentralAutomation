@@ -19,18 +19,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from .filters import AgendaFilter, ItemFilter, _d, select_agendas, select_items
-from .importdata import ImportOptions, check_workbook, files_search, find_file, search_dirs_for, is_duplicate, load_meetings
-from .models import ALL_KINDS, Agenda, Category, Item, Meeting
+from .filters import AgendaFilter, ItemFilter, select_agendas, select_items
+from .models import Agenda, Category, Item
 from ..reporting import ActionResult, Reporter
 from .site import AgendaCenterSite
-from .tasks import find_agenda
 
 AGENDA_ACTIONS = ("scan_agendas", "unpublish_agendas", "delete_agendas", "publish_agendas")
 ITEM_ACTIONS = ("scan_items", "approve_items", "delete_items")
 CATEGORY_ACTIONS = ("publish_categories", "unpublish_categories", "delete_categories")
-ALL_ACTIONS = AGENDA_ACTIONS + ITEM_ACTIONS + CATEGORY_ACTIONS + ("create_categories", "upload_agendas",
-                                                                  "post_import_tasks")
+ALL_ACTIONS = AGENDA_ACTIONS + ITEM_ACTIONS + CATEGORY_ACTIONS + ("create_categories",)
 DESTRUCTIVE = {"delete_agendas", "delete_items", "delete_categories"}
 
 
@@ -74,16 +71,6 @@ class Step:
             shown = ", ".join(names[:4]) + (f" and {len(names) - 4} more" if len(names) > 4 else "")
             return (f"create_categories ({len(names)}, skipping any already on the site): {shown}"
                     + (" (published)" if p.get("publish") else " (draft)"))
-        if self.action == "post_import_tasks":
-            from .tasks import KIND_LABELS
-            kinds = p.get("kinds") or list(KIND_LABELS)
-            return (f"post-import tasks from {Path(p.get('tasks_file') or '').name}: "
-                    + ", ".join(KIND_LABELS.get(k, k) for k in kinds)
-                    + (" (download missing files from the old site)" if p.get("download_missing") else ""))
-        if self.action == "upload_agendas":
-            src = Path(p.get("workbook") or "").name or "(no workbook)"
-            return (f"upload_agendas from {src}" + (f" + {Path(p['json_path']).name}" if p.get("json_path") else "")
-                    + (" and publish" if p.get("publish") else " as drafts"))
         return self.action
 
 
@@ -115,21 +102,6 @@ class Plan:
                     AgendaFilter.from_dict(s.params.get("filter"))
                 if s.action in ITEM_ACTIONS:
                     ItemFilter.from_dict(s.params.get("filter"))
-                if s.action == "upload_agendas":
-                    if not s.params.get("workbook") and not s.params.get("json_path"):
-                        raise ValueError("needs a workbook and/or json_path")
-                    if s.params.get("workbook"):
-                        check_workbook(Path(s.params["workbook"]))
-                    if s.params.get("json_path") and not Path(s.params["json_path"]).is_file():
-                        raise ValueError(f"JSON file not found: {s.params['json_path']}")
-                    for k in s.params.get("kinds") or []:
-                        if k not in ALL_KINDS:
-                            raise ValueError(f"unknown kind {k!r}")
-                if s.action == "post_import_tasks":
-                    if not Path(s.params.get("tasks_file") or "").is_file():
-                        raise ValueError(f"tasks file not found: {s.params.get('tasks_file')}")
-                    if s.params.get("files_dir") and not Path(s.params["files_dir"]).is_dir():
-                        raise ValueError(f"files folder not found: {s.params['files_dir']}")
                 if s.action == "create_categories" and not s.params.get("names"):
                     raise ValueError("needs names")
             except Exception as e:
@@ -147,6 +119,9 @@ class Runner:
     def run(self, plan: Plan) -> None:
         plan.validate()
         self.r.info(("LIVE RUN" if self.live else "DRY RUN (nothing will change)") + f": {plan.name}")
+        forget = getattr(self.site, "forget_view_options", None)
+        if forget:
+            forget()
         for i, step in enumerate(plan.steps, 1):
             self.cancel.check()
             label = f"{i}/{len(plan.steps)} {step.action}"
@@ -320,7 +295,17 @@ class Runner:
             except Exception as e:
                 self.r.error(f"{cat.name}: {e}")
                 results.update({it.id: f"error: {e}" for it in group if not it.default and it.id not in results})
-            for it in (x for x in group if x.default):
+            defaults = [x for x in group if x.default]
+            if action == "delete" and len(defaults) > 1:
+                # All default items in one request, then one read; the rest one by one.
+                try:
+                    self.site.fast_item_delete(cat, [x.id for x in defaults], default=True)
+                    for x in defaults:
+                        results[x.id] = "ok"
+                except Exception as e:
+                    self.r.warn(f"{cat.name}: default item delete in one request didn't work ({e}); "
+                                "going one by one.")
+            for it in (x for x in defaults if x.id not in results):
                 self.cancel.check()
                 try:
                     results[it.id] = self.site.item_action(cat, it, action)
@@ -354,12 +339,17 @@ class Runner:
         first (that also deletes the items placed on them), then the unused
         items and default items, then the emptied folders, then workflows.
         Returns what is still left ("" = empty)."""
-        if contents["agendas"]:
-            self._delete_agendas(label, {"filter": {"categories": [cat.name]}})
-        items = self.site.items(cat) + self.site.items(cat, default=True)
+        # Everything comes from the one reading of the category (contents);
+        # nothing is read again: the category delete itself says if anything is left.
+        ags = contents["agendas"]
+        if ags:
+            pub = [a for a in ags if a.published]
+            done = self._bulk(label, "unpublish", pub) if pub else set()
+            self._bulk(label, "delete", [a for a in ags if not a.published or a.id in done])
+        items = contents["items"] + contents["default_items"]
         if items:
             self._item_actions(label, "delete", items)
-        for f in self.site.folders(cat):
+        for f in contents["folders"]:
             self.cancel.check()
             try:
                 st = self.site.delete_folder(cat, f)
@@ -367,7 +357,7 @@ class Runner:
                 st = f"error: {e}"
             self._res(label, "delete", "item folder", category=cat.name, target_id=str(f.id), description=f.name,
                       status="ok" if st == "ok" else "error", detail="" if st == "ok" else st)
-        for w in self.site.workflows(cat):
+        for w in contents["workflows"]:
             self.cancel.check()
             try:
                 st = self.site.delete_workflow(cat, w)
@@ -375,7 +365,7 @@ class Runner:
                 st = f"error: {e}"
             self._res(label, "delete", "workflow", category=cat.name, target_id=str(w.id), description=w.name,
                       status="ok" if st == "ok" else "error", detail="" if st == "ok" else st)
-        return self._contents_summary(self.site.contents(cat))
+        return ""
 
     def _pick_categories(self, params: dict) -> list[Category]:
         cats = self.site.categories(refresh=True)
@@ -452,6 +442,12 @@ class Runner:
                                   status="error", detail=f"unpublish failed: {st}")
                         continue
             st = self.site.category_action(cat, action)
+            if st != "ok" and action == "delete" and purge:
+                left = self._contents_summary(self.site.contents(cat))
+                if left:
+                    self.r.info(f"{cat.name}: still has {left}; clearing it again.")
+                    self._purge_category(label, cat, self.site.contents(cat))
+                    st = self.site.category_action(cat, action)
             if st == "ok" and action == "unpublish":
                 self.r.record_undo({"undo": "republish_category", "category_id": cat.id, "category": cat.name})
             self._res(label, action, "category", category=cat.name, target_id=str(cat.id),
@@ -459,9 +455,9 @@ class Runner:
 
     def _create_categories(self, label: str, params: dict) -> None:
         publish = bool(params.get("publish"))
-        for name in params.get("names") or []:
+        for i, name in enumerate(params.get("names") or []):
             self.cancel.check()
-            existing = self.site.find_category(name, refresh=True)
+            existing = self.site.find_category(name, refresh=(i == 0))
             if existing:
                 self._res(label, "create", "category", category=name, target_id=str(existing.id),
                           status="skipped", detail="already exists")
@@ -473,408 +469,23 @@ class Runner:
             cat, st = self.site.create_category(name, publish)
             self._res(label, "create", "category", category=name, target_id=str(cat.id) if cat else "",
                       status="ok" if st == "ok" else "error", detail="" if st == "ok" else st)
-
-    # ------------------------------------------------------------- uploading
-    def _upload_agendas(self, label: str, params: dict) -> None:
-        opts = ImportOptions.from_dict(params)
-        meetings, warnings = load_meetings(opts)
-        for w in warnings:
-            self.r.warn(w)
-        meetings = self._filter_meetings(meetings, params)
-        self.r.info(f"{len(meetings)} agenda(s) to consider from the import files.")
-        self.upload_meetings(label, meetings, self.resolver(opts, meetings, params), params)
-
-    def resolver(self, opts: ImportOptions, meetings: list[Meeting], params: dict):
-        """file name -> local path. Looks in the files folder (and the JSON's
-        folders); with download_missing, fetches a file it can't find from
-        where the old (D10) site served it, into <files folder>/downloaded."""
-        files_dir, deep = files_search(opts)
-        search_dirs = search_dirs_for(opts, files_dir)
-        if opts.json_path:
-            jdir = Path(opts.json_path).parent
-            search_dirs += [jdir / t[len("files in: "):] for m in meetings for t in m.json_tasks
-                            if t.startswith("files in: ")]
-        urls = {n.lower(): u for m in meetings for n, u in m.file_urls.items()}
-        download_dir = (files_dir or Path.cwd()) / "downloaded"
-        if params.get("download_missing"):
-            search_dirs.append(download_dir)
-
-        def resolve(name: str) -> Path:
-            p = find_file(name, search_dirs, deep=deep)
-            if p is not None:
-                return p
-            url = urls.get(name.lower())
-            if params.get("download_missing") and url:
-                return download_file(url, download_dir / name, self.r)
-            raise FileNotFoundError(name)
-        return resolve
-
-    def upload_meetings(self, label: str, meetings: list[Meeting], resolve, params: dict) -> None:
-        """Create these agendas (simple, minutes-only, complex), category by
-        category. params: publish, on_missing_category (skip|create),
-        on_duplicate (skip|upload)."""
-        on_missing = params.get("on_missing_category", "skip")
-        on_duplicate = params.get("on_duplicate", "skip")
-        publish = bool(params.get("publish"))
-        by_cat: dict[str, list[Meeting]] = {}
-        for m in meetings:
-            by_cat.setdefault(m.category, []).append(m)
-
-        done_total, total = 0, len(meetings)
-        for cat_name, group in by_cat.items():
-            self.cancel.check()
-            cat = self.site.find_category(cat_name, refresh=True)
-            if cat is None:
-                if on_missing != "create":
-                    for m in group:
-                        self._meeting_res(label, m, "skipped", f"category '{cat_name}' is not on the site "
-                                          "(on_missing_category=skip)")
-                    done_total += len(group)
-                    continue
-                if not self.live:
-                    self._res(label, "create", "category", category=cat_name, status="dry-run",
-                              detail="would create (missing)" + (" and publish" if publish else ""))
-                else:
-                    cat, st = self.site.create_category(cat_name, publish)
-                    self._res(label, "create", "category", category=cat_name,
-                              target_id=str(cat.id) if cat else "", status="ok" if cat else "error", detail=st)
-                    if cat is None:
-                        for m in group:
-                            self._meeting_res(label, m, "error", "category could not be created")
-                        continue
-
-            existing = self.site.agendas(cat) if cat else []
-            created: list[int] = []
-            resumed: list[int] = []           # drafts an earlier, stopped run left
-            needs_minutes: list[tuple[int, Meeting]] = []
-            failures = 0
-            for m in group:
-                self.cancel.check()
-                done_total += 1
-                self.r.progress(done_total, total, f"{cat_name} {m.meeting_date}")
-                if m.problems:
-                    self._meeting_res(label, m, "skipped", "; ".join(m.problems))
-                    continue
-                if cat is not None and on_duplicate == "skip":
-                    dup = next((a for a in existing if a.meeting_date == m.meeting_date
-                                and is_duplicate(m, a, self.site.details)), None)
-                    if dup is not None:
-                        # A run stopped between creating and publishing leaves a
-                        # draft (seen live 2026-11-17): finish it on the rerun.
-                        unfinished = self.live and publish and not dup.published
-                        late = self.live and m.later_minutes and not dup.has_minutes
-                        if unfinished or late:
-                            resumed.append(dup.id)
-                            if late:
-                                needs_minutes.append((dup.id, m))
-                        self._meeting_res(label, m, "skipped", f"already on the site as agenda {dup.id}"
-                                          + ("; finishing its publish/minutes" if unfinished or late else ""))
-                        continue
-                if not self.live:
-                    self._meeting_res(label, m, "dry-run", f"would create {m.kind} agenda"
-                                      + (" and publish" if publish else " as draft"))
-                    continue
-                try:
-                    new_id, st = self.site.create_agenda(cat, m, resolve)
-                except Exception as e:
-                    new_id, st = None, f"error: {e}"
-                if new_id is not None:
-                    created.append(new_id)
-                    self.r.record_undo({"undo": "delete_created", "category_id": cat.id,
-                                        "category": cat.name, "agenda_id": new_id})
-                    if m.later_minutes and st == "ok":
-                        needs_minutes.append((new_id, m))
-                        st_detail = "created; minutes are added after it is published"
-                    else:
-                        st_detail = st
-                else:
-                    st_detail = st
-                self._meeting_res(label, m, "ok" if st == "ok" else "error", st_detail, agenda_id=new_id)
-                failures = 0 if st == "ok" else failures + 1
-                if failures >= MAX_CONSECUTIVE_FAILURES:
-                    self.r.error(f"{failures} uploads in a row failed in {cat_name}; moving on.")
-                    break
-
-            if not self.live or not (created or resumed):
-                continue
-            # Minutes can only be added to a published agenda, so agendas that get
-            # minutes later are published even on a draft upload, then unpublished.
-            to_publish = set(created + resumed) if publish else {i for i, _ in needs_minutes}
-            if to_publish:
-                self.r.info(f"{cat_name}: publishing {len(to_publish)} new agenda(s) (Notify Me: Don't Send)")
-                now = [a for a in self.site.agendas(cat) if a.id in to_publish]
-                fresh = [a for a in now if not a.published]
-                published_ok = self._bulk(label, "publish", fresh) | {a.id for a in now if a.published}
-            else:
-                published_ok = set()
-            for agenda_id, m in needs_minutes:
-                self.cancel.check()
-                if agenda_id not in published_ok:
-                    self._meeting_res(label, m, "error", "minutes not added: the agenda could not be published",
-                                      agenda_id=agenda_id)
-                    continue
-                try:
-                    st = self.site.add_minutes(cat, agenda_id, resolve(m.later_minutes), publish=publish)
-                except Exception as e:
-                    st = f"error: {e}"
-                self._res(label, "add_minutes", "minutes", category=cat.name, target_id=str(agenda_id),
-                          meeting_date=m.meeting_date.isoformat(), description=m.later_minutes,
-                          status="ok" if st == "ok" else "error", detail="" if st == "ok" else st)
-            if not publish and needs_minutes:
-                back = [a for a in self.site.agendas(cat) if a.id in {i for i, _ in needs_minutes} and a.published]
-                if back:
-                    self.r.info(f"{cat_name}: returning {len(back)} agenda(s) to draft after adding minutes")
-                    self._bulk(label, "unpublish", back)
-
-    def add_minutes_to_existing(self, label: str, targets: list[tuple[int, int, Meeting]], resolve,
-                                publish: bool = True) -> None:
-        """Add the import's minutes to agendas already on the site:
-        targets = [(category id, agenda id, meeting)]. The site only allows Add
-        Minutes on a published agenda, so a draft agenda is published for it
-        (Notify Me: Don't Send) and put back to draft afterwards."""
-        groups: dict[int, list[tuple[int, Meeting]]] = {}
-        for cid, aid, m in targets:
-            groups.setdefault(cid, []).append((aid, m))
-        for cid, group in groups.items():
-            self.cancel.check()
-            cat = self._category(cid)
-            by_id = {a.id: a for a in self.site.agendas(cat)}
-            drafts = [by_id[aid] for aid, _ in group if aid in by_id and not by_id[aid].published]
-            if not self.live:
-                for aid, m in group:
-                    fname = m.minutes_file or m.attach_minutes_file
-                    note = " (publishes the draft agenda for it, then puts it back)" if aid in {a.id for a in drafts} else ""
-                    self._res(label, "add_minutes", "minutes", category=cat.name, target_id=str(aid),
-                              meeting_date=m.meeting_date.isoformat(), description=fname, status="dry-run",
-                              detail="would add minutes" + note)
-                continue
-            published_now = self._bulk(label, "publish", drafts) if drafts else set()
-            for aid, m in group:
-                self.cancel.check()
-                fname = m.minutes_file or m.attach_minutes_file
-                if aid not in by_id:
-                    st = "error: the agenda is no longer on the site"
-                elif not by_id[aid].published and aid not in published_now:
-                    st = "error: the agenda could not be published, so minutes can't be added"
-                else:
-                    try:
-                        st = self.site.add_minutes(cat, aid, resolve(fname), publish=publish)
-                    except Exception as e:
-                        st = f"error: {e}"
-                self._res(label, "add_minutes", "minutes", category=cat.name, target_id=str(aid),
-                          meeting_date=m.meeting_date.isoformat(), description=fname,
-                          status="ok" if st == "ok" else "error", detail="" if st == "ok" else st)
-            if published_now:
-                back = [a for a in self.site.agendas(cat) if a.id in published_now and a.published]
-                if back:
-                    self.r.info(f"{cat.name}: returning {len(back)} agenda(s) to draft after adding minutes")
-                    self._bulk(label, "unpublish", back)
-
-    # ------------------------------------------------- post-import tasks
-    def _post_import_tasks(self, label: str, params: dict) -> None:
-        """Finish what the migration tool's importer can't: see tasks.py."""
-        from .tasks import CREATE, KINDS, MEDIA, MINUTES, SAVE, load_tasks
-        tasks_file = Path(params["tasks_file"])
-        tasks, warnings = load_tasks(tasks_file)
-        for w in warnings:
-            self.r.warn(w)
-        tasks = [t for t in tasks if t.category]
-        kinds = [k for k in KINDS if k in (params.get("kinds") or KINDS)]
-        resolve, can_find = self._tasks_resolver(tasks_file, tasks, params)
-        if not hasattr(self, "saved_agendas"):
-            self.saved_agendas: set[int] = set()
-        for k in kinds:
-            self.cancel.check()
-            todo = [t for t in tasks if k in t.tasks]
-            self.r.info(f"{len(todo)} meeting(s) to {k}.")
-            if k == CREATE:
-                self._pit_create(label, todo, resolve, can_find, params)
-            elif k == MINUTES:
-                self._pit_minutes(label, todo, resolve, can_find, params)
-            else:
-                self._pit_edit(label, todo, k)
-
-    def _tasks_resolver(self, tasks_file: Path, tasks, params: dict):
-        """Files are looked for in the files folder, the tasks file's folder,
-        their <site>-agenda-center-attach-after-import folders and anywhere
-        below them (a name found once). With download_missing, a file that
-        isn't there is fetched from the old site into <files folder>/downloaded."""
-        from .tasks import NO_AGENDA_TEMPLATE, no_agenda_template_pdf, to_meeting
-        base = Path(params["files_dir"]) if params.get("files_dir") else tasks_file.parent
-        folders = {t.local_folder for t in tasks if t.local_folder} | \
-                  {(t.manual or {}).get("localFolder") for t in tasks if t.manual and t.manual.get("localFolder")}
-        dirs = [base] + [base / f for f in folders] + [tasks_file.parent] + [tasks_file.parent / f for f in folders]
-        download_dir = base / "downloaded"
-        dirs.append(download_dir)
-        urls: dict[str, str] = {}
-        for t in tasks:
-            if t.minutes_file and t.minutes_url:
-                urls[t.minutes_file.lower()] = t.minutes_url
-            m = to_meeting(t) if t.manual else None
-            if m:
-                urls.update({n.lower(): u for n, u in m.file_urls.items()})
-
-        def local(name: str) -> Optional[Path]:
-            return find_file(name, [d for d in dirs if d.exists()], deep=True)
-
-        def can_find(name: str) -> str:
-            """'' if the file is there; else what will happen."""
-            if name == NO_AGENDA_TEMPLATE or local(name) is not None:
-                return ""
-            if params.get("download_missing") and urls.get(name.lower()):
-                return "download"
-            return "missing"
-
-        def resolve(name: str) -> Path:
-            p = local(name)
-            if p is not None:
-                return p
-            if name == NO_AGENDA_TEMPLATE:
-                download_dir.mkdir(parents=True, exist_ok=True)
-                (download_dir / name).write_bytes(no_agenda_template_pdf())
-                return download_dir / name
-            url = urls.get(name.lower())
-            if params.get("download_missing") and url:
-                return download_file(url, download_dir / name, self.r)
-            raise FileNotFoundError(name)
-        return resolve, can_find
-
-    def _task_res(self, label: str, action: str, t, status: str, detail: str = "", target_id: str = "",
-                  files: str = "") -> None:
-        self._res(label, action, "agenda", category=t.category, target_id=target_id,
-                  meeting_date=t.meeting_date.isoformat() if t.meeting_date else "", description=t.description,
-                  status=status, detail=detail, files=files)
-
-    def _site_agendas(self, name: str, cache: dict):
-        """(category, its agendas) by name, read once per step."""
-        key = name.strip().lower()
-        if key not in cache:
-            cat = self.site.find_category(name, refresh=not cache)
-            if cat is not None:
-                self.site.ensure_view_options(cat)
-            cache[key] = (cat, self.site.agendas(cat) if cat is not None else [])
-        return cache[key]
-
-    def _pit_create(self, label: str, todo, resolve, can_find, params: dict) -> None:
-        from .tasks import to_meeting
-        meetings = []
-        for t in todo:
-            m = to_meeting(t)
-            if m is None:
-                self._task_res(label, "create", t, "skipped",
-                               "no meeting date" if t.manual else "the tasks file has no details for it (use the .json)")
-                continue
-            missing = [f for f in m.all_files() if can_find(f) == "missing"]
-            if missing:
-                m.problems.append("missing file(s): " + ", ".join(missing))
-            elif any(can_find(f) == "download" for f in m.all_files()):
-                m.notes.append("some files will be downloaded from the old site")
-            meetings.append(m)
-        if meetings:
-            self.upload_meetings(label, meetings, resolve, {
-                "publish": params.get("publish", True), "on_duplicate": "skip",
-                "on_missing_category": "create" if params.get("create_missing_categories") else "skip"})
-
-    def _pit_minutes(self, label: str, todo, resolve, can_find, params: dict) -> None:
-        cache: dict = {}
-        targets = []
-        for t in todo:
-            self.cancel.check()
-            cat, agendas = self._site_agendas(t.category, cache)
-            if cat is None:
-                self._task_res(label, "add_minutes", t, "skipped", f"category '{t.category}' isn't on the site")
-                continue
-            a, why = find_agenda(t, agendas)
-            if a is None:
-                self._task_res(label, "add_minutes", t, "error", f"agenda not found: {why}")
-                continue
-            if a.has_minutes:
-                self._task_res(label, "add_minutes", t, "skipped", "the agenda already has minutes", str(a.id))
-                continue
-            where = can_find(t.minutes_file)
-            if not t.minutes_file or where == "missing":
-                self._task_res(label, "add_minutes", t, "skipped",
-                               f"minutes file not found: {t.minutes_file or '(none named)'}", str(a.id),
-                               files=t.minutes_file)
-                continue
-            m = Meeting(t.category, a.meeting_date or t.meeting_date, t.description, t.description,
-                        minutes_file=t.minutes_file)
-            targets.append((cat.id, a.id, m))
-        if targets:
-            self.add_minutes_to_existing(label, targets, resolve, publish=params.get("publish", True))
-
-    def _pit_edit(self, label: str, todo, kind: str) -> None:
-        """add-media-links and save-to-build-html: both are edit + Save. An
-        agenda saved for its video links in this run isn't saved again."""
-        from .tasks import MEDIA
-        cache: dict = {}
-        action = "video_links" if kind == MEDIA else "save"
-        for t in todo:
-            self.cancel.check()
-            cat, agendas = self._site_agendas(t.category, cache)
-            if cat is None:
-                self._task_res(label, action, t, "skipped", f"category '{t.category}' isn't on the site")
-                continue
-            a, why = find_agenda(t, agendas)
-            if a is None:
-                self._task_res(label, action, t, "error", f"agenda not found: {why}")
-                continue
-            extra = f"; {len(t.overflow)} more video link(s) have no field on Central" if t.overflow else ""
-            if kind == MEDIA:
-                now = self.site.video_links(cat, a.id)
-                want = (t.video, t.additional_video)
-                if (now[0] or "", now[1] or "") == (want[0] or now[0], want[1] or now[1]) and now[0]:
-                    self._task_res(label, action, t, "skipped", "the video links are already set" + extra, str(a.id))
-                    continue
-                if not self.live:
-                    self.saved_agendas.add(a.id)      # its save also builds the page
-                    self._task_res(label, action, t, "dry-run", f"would set Link to Media to {t.video}"
-                                   + (f" and Additional Video Link to {t.additional_video}" if t.additional_video else "")
-                                   + extra, str(a.id))
-                    continue
-                try:
-                    st = self.site.edit_and_save(cat, a.id, t.video or None, t.additional_video or None)
-                except Exception as e:
-                    st = f"error: {e}"
-            else:
-                if a.id in self.saved_agendas:
-                    self._task_res(label, action, t, "skipped", "already saved in this run (with its video links)", str(a.id))
-                    continue
-                if not self.live:
-                    self._task_res(label, action, t, "dry-run", "would open and save (builds the public agenda page)",
-                                   str(a.id))
-                    continue
-                try:
-                    st = self.site.edit_and_save(cat, a.id)
-                except Exception as e:
-                    st = f"error: {e}"
-            if st == "ok":
-                self.saved_agendas.add(a.id)
-            self._task_res(label, action, t, "ok" if st == "ok" else "error", ("" if st == "ok" else st) + extra,
-                           str(a.id))
-
-    def _filter_meetings(self, meetings: list[Meeting], params: dict) -> list[Meeting]:
-        cats = {c.strip().lower() for c in params.get("categories") or []}
-        kinds = set(params.get("kinds") or [])
-        lo, hi = _d(params.get("meeting_from")), _d(params.get("meeting_to"))
-        out = [m for m in meetings
-               if (not cats or m.category.strip().lower() in cats)
-               and (not kinds or m.kind in kinds)
-               and (lo is None or m.meeting_date >= lo) and (hi is None or m.meeting_date <= hi)]
-        limit = params.get("limit")
-        return out[:limit] if limit else out
-
-    def _meeting_res(self, label: str, m: Meeting, status: str, detail: str, agenda_id: Optional[int] = None) -> None:
-        files = " | ".join(x for x in (
-            f"agenda: {m.agenda_file}" if m.agenda_file else "",
-            f"minutes: {m.minutes_file}" if m.minutes_file else "",
-            *(f"item '{it.name}': {', '.join(it.files)}" for it in m.items),
-            f"minutes (added after publish): {m.attach_minutes_file}" if m.attach_minutes_file else "") if x)
-        self._res(label, "upload", "agenda", category=m.category, target_id=str(agenda_id or ""),
-                  meeting_date=m.meeting_date.isoformat(), description=m.description, status=status, files=files,
-                  detail=f"[{m.kind}; {m.source} row {m.source_row}] {detail}" if m.source == "workbook"
-                  else f"[{m.kind}; json] {detail}")
-
+        if self.live and params.get("names"):
+            # The one check worth making before an import: Content Import only
+            # sees published categories that exist. One read of the list; any
+            # that's missing is made through the page, any draft is published.
+            now = {c.name.strip().lower(): c for c in self.site.categories(refresh=True)}
+            for name in params["names"]:
+                c = now.get(name.strip().lower())
+                if c is None:
+                    self.r.warn(f"Category '{name}' isn't on the site after creating it; making it through the page.")
+                    c, st = self.site.create_category(name, publish, direct=False)
+                    self._res(label, "create", "category", category=name, target_id=str(c.id) if c else "",
+                              status="ok" if c else "error", detail="made through the page" if c else st)
+                elif publish and not c.published:
+                    st = self.site.category_action(c, "publish")
+                    self._res(label, "publish", "category", category=name, target_id=str(c.id),
+                              status="ok" if st == "ok" else "error",
+                              detail="it was still a draft" if st == "ok" else st)
 
 def undo_plan(path: Path) -> "Plan":
     """A plan that reverses what a live run recorded in its undo.json."""
@@ -893,24 +504,3 @@ def undo_plan(path: Path) -> "Plan":
     if created:
         steps.append(Step("delete_agendas", {"filter": {"agenda_ids": created}, "unpublish_first": True}))
     return Plan(name=f"Undo {Path(path).parent.name}", steps=steps)
-
-
-def download_file(url: str, dest: Path, r: Reporter) -> Path:
-    """Fetch one file from the old site (public URL) to dest. Only used when
-    the run asks for download_missing; never touches the Central site."""
-    import urllib.request
-    from urllib.parse import urlparse
-    if urlparse(url).scheme not in ("http", "https"):
-        raise FileNotFoundError(f"{dest.name}: not an http(s) address: {url}")
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_name(dest.name + ".part")
-    req = urllib.request.Request(url, headers={"User-Agent": "CentralAutomation file fetch"})
-    with urllib.request.urlopen(req, timeout=120) as resp, open(tmp, "wb") as fh:
-        while True:
-            chunk = resp.read(1 << 16)
-            if not chunk:
-                break
-            fh.write(chunk)
-    tmp.replace(dest)
-    r.info(f"Downloaded {dest.name} from the old site.")
-    return dest

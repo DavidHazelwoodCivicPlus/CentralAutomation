@@ -15,7 +15,8 @@ from . import parse
 from .browser import Browser, SiteError
 from .historylog import HistoryLog, join_history
 from .models import InventoryRow, ModuleScan
-from .modules import MODULES, ModuleDef
+from .modules import FIXED_LABELS, MODULES, ModuleDef
+from .sitecontent import add_doc_rows, add_page_rows, add_staff_rows, mark_shared_blocks
 
 # JavaScript step for Browser.frames(): on a classic module page, pick
 # "View List" in the dropdown of one category. Picking a list view only
@@ -104,6 +105,23 @@ class SiteProfile:
         return [m for m in MODULES if self.modules.get(m.key, {}).get("present")]
 
 
+def tree_from_loader(cats: list[dict]) -> list[dict]:
+    """Departments as relay.js lists them from the tree's loader ({id, name,
+    published, parent}, parents before children) -> the shape staff_tree()
+    gives ({id, name, status, parent, path})."""
+    by_id = {int(c["id"]): c for c in cats if c and c.get("id")}
+    out = []
+    for c in by_id.values():
+        path, p = [], c.get("parent")
+        while p and int(p) in by_id and len(path) < 20:
+            path.insert(0, by_id[int(p)]["name"])
+            p = by_id[int(p)].get("parent")
+        out.append({"id": int(c["id"]), "name": c.get("name") or "", "parent": int(c["parent"]) if c.get("parent") else None,
+                    "path": path, "status": "published" if c.get("published") is True
+                    else "unpublished" if c.get("published") is False else ""})
+    return out
+
+
 class Scanner:
     def __init__(self, browser: Browser, parallel: int = 4,
                  on_module_done: Optional[Callable[[ModuleScan], None]] = None,
@@ -122,8 +140,8 @@ class Scanner:
         the page's module id. Also keeps each landing page for the scan."""
         modules = modules or MODULES
         prof = SiteProfile(self.b.site_url)
-        newer = [m for m in modules if m.style == "newer"]
-        classic = [m for m in modules if m.style != "newer"]
+        newer = [m for m in modules if m.style in ("newer", "pages", "docs")]
+        classic = [m for m in modules if m.style not in ("newer", "pages", "docs")]
         for m, res in zip(newer, self.b.fetch_many([m.path for m in newer], parallel=self.parallel)):
             prof.modules[m.key] = self._landing(m, res.get("ok"), res.get("url"), res.get("text", ""),
                                                 f"HTTP {res.get('status')}")
@@ -138,7 +156,7 @@ class Scanner:
         found = parse.module_id_of(html) if ok else None
         present = found == m.module_id
         label = parse.page_title(html) if present else ""
-        if label.lower() in ("", "civicplus"):
+        if label.lower() in ("", "civicplus") or m.key in FIXED_LABELS:
             label = m.label
         info = {"present": present, "label": label, "html": html if present else "", "url": url or ""}
         if not present:
@@ -174,7 +192,9 @@ class Scanner:
             reader(m, info["html"], ms)
             for row in ms.rows:
                 row.module_label = ms.label
-            if with_history and ms.rows:
+            if with_history and ms.rows and m.key in ("pages", "docs"):
+                ms.problems.append(f"History Log isn't read for {ms.label}: it is far too big to be worth it")
+            elif with_history and ms.rows:
                 try:
                     entries = self.history.module_history(m.module_id)
                 except SiteError as e:
@@ -443,17 +463,26 @@ class Scanner:
                                                             {k for k, v in it["cols"].items() if v == it["name"]})))
 
     def _scan_staff(self, m: ModuleDef, html: str, ms: ModuleScan) -> None:
-        """Departments from the tree (ids, status, nesting), expanded in a
-        hidden frame with the page's own Expand Current View. Employees from
-        the module's own Export Staff workbook (it lists every department and
-        employee, but without ids)."""
-        res = self.b.frames([{"src": m.path, "steps": [STAFF_EXPAND_JS]}], parallel=1, settle=2,
-                            page_timeout=120)[0]
-        if not res.get("ok"):
-            ms.problems.append(f"Couldn't expand the department tree: {res.get('error')}")
+        """Departments and employees from the department tree's own loader
+        (ids, published or not, nesting; people as "Last, First"), with
+        title, email and phone added from the module's Export Staff workbook.
+        If the loader can't list the departments, the tree is expanded in a
+        hidden frame with the page's own Expand Current View instead."""
+        from .actions.engine import Relay
+        tree: list[dict] = []
+        try:
+            tree = tree_from_loader(Relay(self.b).call("staff", "cats") or [])
+        except SiteError as e:
+            if "logged us out" in str(e):
+                raise
+            self.r.warn(f"{ms.label}: couldn't list the departments from the tree's loader ({e}); "
+                        "expanding the tree in a hidden frame instead.")
+        if not tree:
+            res = self.b.frames([{"src": m.path, "steps": [STAFF_EXPAND_JS]}], parallel=1, settle=2,
+                                page_timeout=120)[0]
+            if not res.get("ok"):
+                ms.problems.append(f"Couldn't expand the department tree: {res.get('error')}")
             tree = parse.staff_tree(res["pages"][-1]) if res.get("pages") else []
-        else:
-            tree = parse.staff_tree(res["pages"][-1])
         for d in tree:
             ms.rows.append(InventoryRow(m.key, "category", " > ".join(d["path"] + [d["name"]]), d["name"],
                                         d["status"], category_id=d["id"],
@@ -464,11 +493,20 @@ class Scanner:
             data, _ = self.b.fetch_bytes("/Admin/Directory/Admin/ExportAllExcel")
             export = parse.staff_export(data)
         except Exception as e:
-            ms.problems.append(f"Couldn't read Export Staff: {e}")
-            return
-        if len(export["departments"]) != len(tree):
+            ms.problems.append(f"Couldn't read Export Staff (no titles, emails or phones): {e}")
+            export = {"departments": [], "employees": []}
+        if export["departments"] and len(export["departments"]) != len(tree):
             ms.problems.append(f"Export Staff lists {len(export['departments'])} department(s); "
                                f"the tree showed {len(tree)}")
+        if tree:
+            try:
+                people = Relay(self.b).call("staff", "employees", [d["id"] for d in tree])
+            except SiteError as e:
+                ms.problems.append(f"Couldn't read the employees from the department tree: {e}")
+                people = None
+            if people is not None:
+                add_staff_rows(ms, tree, people, export["employees"])
+                return
         for e in export["employees"]:
             first = e.get("First Name") or e.get("FirstName") or ""
             last = e.get("Last Name") or e.get("LastName") or ""
@@ -481,4 +519,78 @@ class Scanner:
                                                 "Phone": e.get("Phone") or e.get("Work Phone") or ""}))
         if export["employees"]:
             ms.problems.append("Employees come from Export Staff, which has no IDs, so they have no "
-                               "Created / Created By and no status yet")
+                               "Created / Created By and no status")
+
+    # ---------------------------------------------------------------- pages
+    PAGE_BATCH = 60
+
+    def _scan_pages(self, m: ModuleDef, html: str, ms: ModuleScan) -> None:
+        """Every page, published or not (Live Edit's own page list), each read
+        as the logged-in admin sees it with Live Edit on. A page row says its
+        status, path, widgets and how many links of each kind it has; under
+        it, one row per widget, link and image in its content area (the site's
+        header, menus and footer are left out)."""
+        from .actions.engine import Relay
+        relay = Relay(self.b)
+        listed = relay.call("pages", "list")
+        slugs = {int(p["id"]): p["slug"] for p in listed}
+        ids = list(slugs)
+        self.r.info(f"{ms.label}: {len(ids)} pages on the site; reading each one...")
+        # A plain read is about 4x quicker than a Live Edit one (0.16 s against
+        # 0.6 s a page on training19), but shows an unpublished page as the 404
+        # page, which then has to be read again with Live Edit. So each batch
+        # is read the way that was cheaper for the batch before: plainly while
+        # at least a quarter of the pages are published, with Live Edit when
+        # nearly all are unpublished.
+        read: list[dict] = []
+        plain = True
+        for i in range(0, len(ids), self.PAGE_BATCH):
+            batch = ids[i:i + self.PAGE_BATCH]
+            got = relay.call("pages", "read", batch, not plain)
+            unpublished = sum(1 for g in got if g.get("status") not in ("published",))
+            if plain:
+                again = [g["id"] for g in got if g.get("status") == "not found"]
+                if again:
+                    fixed = {g["id"]: g for g in relay.call("pages", "read", again, True)}
+                    got = [fixed.get(g["id"], g) for g in got]
+                unpublished = len(again)
+            was = plain
+            plain = unpublished <= 0.75 * len(batch)
+            if was and not plain:
+                self.r.info(f"{ms.label}: most pages here are unpublished, so they're read with Live Edit on.")
+            read += got
+            self.r.progress(len(read), len(ids), "pages")
+            if len(read) % 300 < self.PAGE_BATCH or len(read) == len(ids):
+                self.r.info(f"{ms.label}: read {len(read)} of {len(ids)} pages.")
+        for pg in read:
+            add_page_rows(ms, pg, slugs.get(int(pg["id"]), ""), self.b.host)
+        mark_shared_blocks(ms)
+        try:                                      # the site's look, for previews of text blocks
+            sheets = relay.call("pages", "styles", 1)
+        except SiteError:
+            sheets = []
+        for r in ms.rows:
+            if r.level == "category" and r.category_id == 1:
+                r.extra["stylesheets"] = sheets
+        bad = [pg for pg in read if pg.get("error")]
+        if bad:
+            ms.problems.append(f"{len(bad)} page(s) couldn't be read as pages (e.g. {bad[0]['id']}: {bad[0]['error']})")
+
+
+    # ----------------------------------------------------- documents and images
+    def _scan_docs(self, m: ModuleDef, html: str, ms: ModuleScan) -> None:
+        """Document Center and Public Images: every folder (nested) and every
+        file in it, with Central's own reference count. Which pages use each
+        file comes from the Pages tab's read (matched in the window)."""
+        from .actions.engine import Relay
+        relay = Relay(self.b)
+        for root in relay.call("docs", "roots"):
+            t0 = time.monotonic()
+            folders = relay.call("docs", "folders", root["id"], root["src"])
+            ids = [root["id"]] + [f["id"] for f in folders]
+            files: list[dict] = []
+            for i in range(0, len(ids), 40):
+                files += relay.call("docs", "files", ids[i:i + 40], root["src"])
+                self.r.progress(min(i + 40, len(ids)), len(ids), root["name"])
+            add_doc_rows(ms, root, folders, files)
+            self.r.info(f"{root['name']}: {len(folders)} folder(s), {len(files)} file(s) in {time.monotonic() - t0:.0f}s.")

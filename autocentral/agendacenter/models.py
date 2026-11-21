@@ -89,6 +89,7 @@ class Agenda:
     minutes_id: int = 0
     # Filled in only when details are fetched (about 1 second per agenda).
     details: Optional["AgendaDetails"] = None
+    list_page: int = 0        # the page of the category's agenda list it was on when read
 
 
 @dataclass

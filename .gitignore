@@ -6,3 +6,4 @@ runs/
 settings.json
 cache/
 plans/_todo.json
+plans/current_plan.json

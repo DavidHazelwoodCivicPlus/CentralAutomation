@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 
 from .browser import Browser
 from .inventory import export_xlsx
-from .modules import BY_KEY, MODULES
+from .modules import BY_KEY, MODULES, SLOW_KEYS
 from .reporting import Cancelled, Reporter
 from .scanner import Scanner
 
@@ -54,6 +54,8 @@ def main(argv: list[str]) -> int:
         if k not in BY_KEY:
             print(f"Unknown module {k!r}. Known: {', '.join(BY_KEY)}")
             return 2
+    # Pages and Documents take minutes on a big site: only read when asked for (--modules pages,docs).
+    keys = keys or [m.key for m in MODULES if m.key not in SLOW_KEYS]
 
     def log(level: str, msg: str) -> None:
         print(("! " if level in ("warn", "error") else "  ") + msg, flush=True)

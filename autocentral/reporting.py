@@ -16,8 +16,9 @@ from pathlib import Path
 from typing import Callable, Optional
 
 
-class Cancelled(Exception):
-    """Raised inside the core when the front end asked to stop."""
+class Cancelled(BaseException):
+    """Raised inside the core when the front end asked to stop. A BaseException,
+    so no "except Exception" that keeps a run going past one failure can swallow it."""
 
 
 class CancelToken:

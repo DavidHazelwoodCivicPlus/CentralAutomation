@@ -33,7 +33,7 @@ from selenium.webdriver.remote.webelement import WebElement
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-from .reporting import CancelToken, Reporter
+from .reporting import CancelToken, Cancelled, Reporter
 
 WAIT = 15
 UPLOAD_WAIT = 300         # saving an agenda with large files
@@ -125,6 +125,7 @@ function runJob(job) {
                     return;
                 }
                 guard(w);
+                if (__state.cancel) { finish(false, 'stopped'); return; }
                 try {
                     if (job.capture === 'each' || stage === steps.length) pages.push(doc.documentElement.outerHTML);
                     if (stage === steps.length) { finish(true); return; }
@@ -141,6 +142,8 @@ function runJob(job) {
             }, (tries ? 0.5 : settle) * 1000);
         };
         f.onload = () => { if (!waiting) onPage(0); };
+        // Stop: end this frame now, wherever it is (Browser._run_background calls these).
+        (__state.kill = __state.kill || []).push(() => finish(false, 'stopped'));
         arm();
         f.src = job.src;
         document.body.appendChild(f);
@@ -159,14 +162,21 @@ let next = 0;
 async function worker() {
     while (next < urls.length && !__state.cancel) {
         const i = next++;
+        const ac = new AbortController();
+        (__state.kill = __state.kill || []).push(() => ac.abort());
         try {
-            const r = await fetch(urls[i], {credentials: 'same-origin', cache: 'no-store'});
+            const r = await fetch(urls[i], {credentials: 'same-origin', cache: 'no-store', signal: ac.signal});
             out[i] = {ok: r.ok, status: r.status, url: r.url, text: await r.text()};
         } catch (e) { out[i] = {ok: false, status: 0, url: urls[i], text: String(e)}; }
     }
 }
 Promise.all(Array.from({length: Math.min(parallel, urls.length)}, worker)).then(() => done(out));
 """
+
+
+# Faster pages in the tool's own Chrome: no pictures, and pages are used once
+# built instead of fully loaded. Set False if a page ever acts half-loaded.
+FAST_PAGES = True
 
 
 class Browser:
@@ -198,6 +208,11 @@ class Browser:
             for flag in ("--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows",
                          "--disable-renderer-backgrounding"):
                 options.add_argument(flag)
+            if FAST_PAGES:
+                # Pictures aren't needed to fill in forms, and pages are used
+                # as soon as they're built, without waiting for the rest.
+                options.add_experimental_option("prefs", {"profile.managed_default_content_settings.images": 2})
+                options.page_load_strategy = "eager"
         self.driver = webdriver.Chrome(options=options)
 
     def quit(self) -> None:
@@ -272,10 +287,27 @@ class Browser:
             modal = self.d.find_element(By.ID, SESSION_TIMEOUT_MODAL_ID)
             if not modal.is_displayed():
                 return False
-            btn = modal.find_element(By.CSS_SELECTOR, SESSION_REFRESH_SELECTOR)
+            # The refresh button, else any "still here / stay / continue" button.
+            buttons = modal.find_elements(By.CSS_SELECTOR, SESSION_REFRESH_SELECTOR) or [
+                b for b in modal.find_elements(By.CSS_SELECTOR, "button, a, input[type=button]")
+                if re.search(r"still here|stay|continue|refresh|keep", (b.text or b.get_attribute("value") or ""), re.I)]
+            if not buttons:
+                return False
+            btn = buttons[0]
+            # A script click doesn't always count with this prompt (seen live
+            # 2026-11-19: it stayed up); a real mouse click does.
             self.js_click(btn)
-            self.r.info("Session-timeout prompt appeared; clicked Refresh Session.")
-            time.sleep(1.0)
+            time.sleep(0.5)
+            if modal.is_displayed():
+                try:
+                    btn.click()
+                except WebDriverException:
+                    pass
+                time.sleep(0.5)
+            now = time.monotonic()
+            if now - getattr(self, "_session_logged", 0) > 60:
+                self._session_logged = now
+                self.r.info("Session-timeout prompt appeared; answered it to stay signed in.")
             try:
                 text = self.d.switch_to.alert.text
                 if _is_stray_alert(text):
@@ -492,11 +524,12 @@ class Browser:
         token = self._script_past_stray_alerts(starter, *args)
         poll = ("const s = (window.__ac || {})[arguments[0]];"
                 "if (!s) return {gone: true};"
-                "if (arguments[1]) s.cancel = true;"
+                "if (arguments[1] && !s.cancel) { s.cancel = true; (s.kill || []).forEach(k => { try { k(); } catch (e) {} }); }"
                 "if (!s.done) return {done: false};"
                 "delete window.__ac[arguments[0]];"
                 "return {done: true, value: s.value};")
         end = time.time() + timeout
+        stopped_at = 0.0
         while True:
             time.sleep(0.5)
             stop = self.cancel.cancelled
@@ -507,7 +540,11 @@ class Browser:
                 self.cancel.check()
                 return state.get("value") or []
             if stop:
-                # let the pages in flight finish, then report the stop
+                # The frames and fetches in flight were ended by the poll above;
+                # don't wait more than a few seconds for the page to wind down.
+                stopped_at = stopped_at or time.time()
+                if time.time() - stopped_at > 3:
+                    raise Cancelled()
                 continue
             if time.time() > end:
                 self.d.execute_script(poll, token, True)
@@ -555,9 +592,26 @@ class Browser:
             if r.get("ok") or r.get("status") not in (0, None):
                 break
             self.sleep(5 * (attempt + 1))
+        if not r.get("ok") and r.get("status") in (0, None) and self.handle_session_timeout():
+            r = self.fetch_many([path])[0]          # the "still logged in?" prompt was up: answered, try again
         if not r.get("ok"):
+            if r.get("status") in (0, None) and self.logged_out():
+                raise SiteError("The site logged us out (the login has expired). Log in again, then click Start "
+                                "to carry on: what's already done is skipped.")
             raise SiteError(f"Fetch {path} failed: HTTP {r.get('status')}")
         return r["text"]
+
+    def logged_out(self) -> bool:
+        """True when the session has ended: a request to /Admin is sent to the
+        sign-in site (which the browser blocks from a script), or lands on it."""
+        self.handle_session_timeout()
+        try:
+            r = self.d.execute_async_script(
+                "const done = arguments[0]; fetch('/Admin', {credentials: 'same-origin'})"
+                ".then(r => done({ok: r.ok, url: r.url})).catch(e => done({err: String(e)}));") or {}
+        except Exception:
+            return False
+        return bool(r.get("err")) or "signin" in (r.get("url") or "").lower() or "login" in (r.get("url") or "").lower()
 
     def frames(self, jobs: list[dict], parallel: int = 4, settle: float = 1.0,
                page_timeout: float = 60.0) -> list[dict]:
@@ -584,6 +638,10 @@ class Browser:
         res = self._run_background(_FRAMES_JS, [{**j, "src": self.url(j["src"])} for j in jobs],
                                    parallel, settle, page_timeout,
                                    timeout=30 + rounds * longest * (page_timeout + settle + 5))
+        res = list(res or [])
+        res += [None] * (len(jobs) - len(res))
+        res = [r if isinstance(r, dict) else {"ok": False, "url": "", "pages": [], "error": "the page gave no answer"}
+               for r in res]
         for r in res:
             self._check_host(r.get("url"))
         return res

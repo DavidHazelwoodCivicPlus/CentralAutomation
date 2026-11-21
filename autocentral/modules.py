@@ -17,11 +17,13 @@ class ModuleDef:
     key: str
     label: str            # our name; the site's own name is read from its page
     path: str             # admin URL path
-    style: str            # newer | classic | calendar | resdir | staff
+    style: str            # newer | classic | calendar | resdir | staff | pages | docs
     module_id: int        # hdnModuleID on its pages, and the History Log module filter
 
 
 MODULES: list[ModuleDef] = [
+    ModuleDef("pages", "Pages", "/Admin/Pages", "pages", 76),
+    ModuleDef("docs", "Document Center", "/Admin/DocumentCenter", "docs", 75),
     ModuleDef("agenda", "Agenda Center", "/Admin/AgendaCenter", "newer", 65),
     ModuleDef("archive", "Archive Center", "/admin/Archive.aspx", "classic", 15),
     ModuleDef("bids", "Bids", "/admin/Bids.aspx", "classic", 16),
@@ -33,6 +35,15 @@ MODULES: list[ModuleDef] = [
     ModuleDef("news", "News Flash", "/admin/CivicAlerts.aspx", "classic", 1),
     ModuleDef("staff", "Staff Directory", "/admin/Directory.aspx", "staff", 4),
 ]
+
+# Tabs always named our way, whatever the site calls the module
+# ("Community Resource Directory" -> "Resource Directory").
+FIXED_LABELS = {"resdir", "docs", "pages"}
+
+# Read only when asked for (their own tab, or --modules): they can take minutes.
+SLOW_KEYS = {"pages", "docs"}
+# Tabs to look at, without publish / unpublish / delete.
+VIEW_ONLY_KEYS: set = set()       # every module tab has actions now (Document Center: 2026-11-21)
 
 BY_KEY = {m.key: m for m in MODULES}
 
